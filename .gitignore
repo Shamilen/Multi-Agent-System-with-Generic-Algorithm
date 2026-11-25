@@ -9,6 +9,7 @@ checkpoints/
 *.pt
 *.pth
 *.gif
+!docs/*.gif
 *.mp4
 *.png
 !docs/*.png

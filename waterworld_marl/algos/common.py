@@ -164,11 +164,13 @@ class RayTransformerEncoder(nn.Module):
         n_heads: int = 4,
         n_layers: int = 1,
         d_ff: int = 64,
+        salience_readout: bool = False,
     ) -> None:
         super().__init__()
         self.n_sensors = int(n_sensors)
         self.feats_per_sensor = 8 if speed_features else 5
         self.is_ctde_critic = bool(is_ctde_critic)
+        self.salience_readout = bool(salience_readout)
         self.obs_dim = self.n_sensors * self.feats_per_sensor + 2
 
         angles = np.linspace(0.0, 2.0 * math.pi, self.n_sensors, endpoint=False, dtype=np.float32)
@@ -183,6 +185,9 @@ class RayTransformerEncoder(nn.Module):
             [_RayTransformerBlock(d_model, n_heads, d_ff) for _ in range(n_layers)]
         )
         self.out_norm = nn.LayerNorm(d_model)
+        self.salience_proj: nn.Linear | None = (
+            nn.Linear(d_model, d_model) if self.salience_readout else None
+        )
         self.out_dim = 4 * d_model
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -214,7 +219,15 @@ class RayTransformerEncoder(nn.Module):
         tok = self.out_norm(tok)
         cls_tok = tok[:, 0]
         ray_out = tok[:, 1:]
-        mean_tok = ray_out.mean(dim=1)
-        cos_tok = (ray_out * self.ray_pos[:, :, 0:1]).mean(dim=1)
-        sin_tok = (ray_out * self.ray_pos[:, :, 1:2]).mean(dim=1)
-        return torch.cat([cls_tok, mean_tok, cos_tok, sin_tok], dim=-1)
+        if self.salience_proj is not None:
+            # Per-channel spatial attention pooling + L-inf max readout:
+            # prevents 1/S averaging dilution of narrow 1-ray poison/food detections.
+            attn_w = F.softmax(self.salience_proj(ray_out), dim=1)
+            pool_tok = ray_out.amax(dim=1)
+            cos_tok = (ray_out * attn_w * self.ray_pos[:, :, 0:1]).sum(dim=1)
+            sin_tok = (ray_out * attn_w * self.ray_pos[:, :, 1:2]).sum(dim=1)
+        else:
+            pool_tok = ray_out.mean(dim=1)
+            cos_tok = (ray_out * self.ray_pos[:, :, 0:1]).mean(dim=1)
+            sin_tok = (ray_out * self.ray_pos[:, :, 1:2]).mean(dim=1)
+        return torch.cat([cls_tok, pool_tok, cos_tok, sin_tok], dim=-1)

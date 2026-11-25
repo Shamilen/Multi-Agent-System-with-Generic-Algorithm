@@ -268,7 +268,9 @@ def test_qmix_monotonicity_and_coop_smoke() -> None:
     assert np.isfinite(ppo_coop_res["best_eval"]["mean_team_return"])
     if dev.type == "cuda":
         assert any("actor_gru" in k for k in ppo_coop_res["state_dict"])
+        assert any("actor_comm" in k for k in ppo_coop_res["state_dict"])
         assert any("critic_comm" in k for k in ppo_coop_res["state_dict"])
+        assert any("salience_proj" in k for k in ppo_coop_res["state_dict"])
     ppo_fn = build_ppo_action_fn(
         tiny_coop, ppo_coop_res["state_dict"], ppo_coop_res["obs_rms_state"], device=dev_str
     )

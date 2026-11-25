@@ -83,6 +83,8 @@ class ActorCriticPPO(nn.Module):
         speed_features: bool = True,
         use_gru: bool = False,
         use_attn_critic: bool = False,
+        use_actor_comm: bool = False,
+        salience_readout: bool = False,
         gru_dim: int = 64,
     ) -> None:
         super().__init__()
@@ -90,7 +92,10 @@ class ActorCriticPPO(nn.Module):
         self.arch = arch
         self.use_gru = bool(use_gru)
         self.use_attn_critic = bool(use_attn_critic)
+        self.use_actor_comm = bool(use_actor_comm)
+        self.salience_readout = bool(salience_readout)
         self.gru_dim = int(gru_dim)
+        self.deadzone = 0.025 if self.use_actor_comm else 0.06
         actor_in = obs_dim + 2
         critic_in = 2 * obs_dim + 2
 
@@ -99,6 +104,7 @@ class ActorCriticPPO(nn.Module):
                 n_sensors=n_sensors,
                 speed_features=speed_features,
                 is_ctde_critic=False,
+                salience_readout=self.salience_readout,
             )
             self.actor_backbone: nn.Module = actor_enc
             actor_feat_dim = actor_enc.out_dim
@@ -117,9 +123,16 @@ class ActorCriticPPO(nn.Module):
 
         if self.use_gru:
             self.actor_gru: nn.GRUCell | None = nn.GRUCell(actor_feat_dim, self.gru_dim)
+            if self.use_actor_comm:
+                self.actor_comm: _CrossAgentCriticBlock | None = _CrossAgentCriticBlock(
+                    d_model=self.gru_dim, n_heads=4, d_ff=self.gru_dim
+                )
+            else:
+                self.actor_comm = None
             self.actor_mean = _ortho_init(nn.Linear(actor_feat_dim + self.gru_dim, 2), gain=0.01)
         else:
             self.actor_gru = None
+            self.actor_comm = None
             self.actor_mean = _ortho_init(nn.Linear(actor_feat_dim, 2), gain=0.01)
 
         if self.use_attn_critic:
@@ -128,6 +141,7 @@ class ActorCriticPPO(nn.Module):
                     n_sensors=n_sensors,
                     speed_features=speed_features,
                     is_ctde_critic=False,
+                    salience_readout=self.salience_readout,
                 )
                 self.critic_backbone: nn.Module | None = c_enc
                 critic_feat_dim = c_enc.out_dim
@@ -210,7 +224,30 @@ class ActorCriticPPO(nn.Module):
             next_h = None
             mean = 0.55 * torch.tanh(self.actor_mean(h_enc))
         norms = torch.linalg.norm(mean, dim=-1, keepdim=True)
-        return torch.where(norms < 0.06, torch.zeros_like(mean), mean), next_h
+        return torch.where(norms < self.deadzone, torch.zeros_like(mean), mean), next_h
+
+    def get_deterministic_action_team(
+        self,
+        team_feat: torch.Tensor,
+        hidden: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Team-batched deterministic action: (E, A, D) -> (E, A, 2), next_hidden."""
+        e_sz, a_sz, d_in = team_feat.shape
+        h_enc = self.actor_backbone(team_feat.reshape(e_sz * a_sz, d_in))
+        if self.actor_gru is not None:
+            if hidden is None:
+                hidden = torch.zeros((e_sz, a_sz, self.gru_dim), dtype=team_feat.dtype, device=team_feat.device)
+            next_h_flat = self.actor_gru(h_enc, hidden.reshape(e_sz * a_sz, self.gru_dim))
+            next_h: torch.Tensor | None = next_h_flat.reshape(e_sz, a_sz, self.gru_dim)
+            comm_h = self.actor_comm(next_h) if self.actor_comm is not None else next_h
+            mean = 0.55 * torch.tanh(
+                self.actor_mean(torch.cat([h_enc.reshape(e_sz, a_sz, -1), comm_h], dim=-1))
+            )
+        else:
+            next_h = None
+            mean = 0.55 * torch.tanh(self.actor_mean(h_enc.reshape(e_sz, a_sz, -1)))
+        norms = torch.linalg.norm(mean, dim=-1, keepdim=True)
+        return torch.where(norms < self.deadzone, torch.zeros_like(mean), mean), next_h
 
     @torch.no_grad()
     def act_rollout_team(
@@ -226,10 +263,13 @@ class ActorCriticPPO(nn.Module):
             if hidden is None:
                 hidden = torch.zeros((e_sz, a_sz, self.gru_dim), dtype=team_feat.dtype, device=team_feat.device)
             next_h_flat = self.actor_gru(h_enc, hidden.reshape(e_sz * a_sz, self.gru_dim))
-            mean = 0.55 * torch.tanh(self.actor_mean(torch.cat([h_enc, next_h_flat], dim=-1)))
             next_h: torch.Tensor | None = next_h_flat.reshape(e_sz, a_sz, self.gru_dim)
+            comm_h = self.actor_comm(next_h) if self.actor_comm is not None else next_h
+            mean = 0.55 * torch.tanh(
+                self.actor_mean(torch.cat([h_enc.reshape(e_sz, a_sz, -1), comm_h], dim=-1))
+            )
         else:
-            mean = 0.55 * torch.tanh(self.actor_mean(h_enc))
+            mean = 0.55 * torch.tanh(self.actor_mean(h_enc.reshape(e_sz, a_sz, -1)))
             next_h = None
 
         logstd = torch.clamp(self.actor_logstd, -3.0, -0.6)
@@ -238,12 +278,7 @@ class ActorCriticPPO(nn.Module):
         action = mean + std * noise
         log_prob = (-0.5 * (noise * noise + 2.0 * logstd + 1.8378770664093453)).sum(dim=-1)
         value = self.get_value_team(team_feat)
-        return (
-            action.reshape(e_sz, a_sz, 2),
-            log_prob.reshape(e_sz, a_sz),
-            value,
-            next_h,
-        )
+        return action, log_prob, value, next_h
 
     def evaluate_sequences(
         self,
@@ -252,7 +287,7 @@ class ActorCriticPPO(nn.Module):
         seq_prev_dones: torch.Tensor,
         init_h: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Vectorized backbone + BPTT GRU + Cross-Agent Attention Critic on (T, M, A, D) chunks."""
+        """Vectorized backbone + BPTT GRU + Actor Comm + Cross-Agent Attention Critic on (T, M, A, D)."""
         t_len, m_sz, a_sz, d_in = seq_feat.shape
         h_enc = self.actor_backbone(seq_feat.reshape(t_len * m_sz * a_sz, d_in)).reshape(
             t_len, m_sz, a_sz, -1
@@ -269,7 +304,13 @@ class ActorCriticPPO(nn.Module):
                 h = self.actor_gru(h_enc[t].reshape(m_sz * a_sz, -1), h)
                 h_steps.append(h)
             h_seq = torch.stack(h_steps, dim=0).reshape(t_len, m_sz, a_sz, self.gru_dim)
-            actor_in = torch.cat([h_enc, h_seq], dim=-1)
+            if self.actor_comm is not None:
+                comm_seq = self.actor_comm(h_seq.reshape(t_len * m_sz, a_sz, self.gru_dim)).reshape(
+                    t_len, m_sz, a_sz, self.gru_dim
+                )
+            else:
+                comm_seq = h_seq
+            actor_in = torch.cat([h_enc, comm_seq], dim=-1)
         else:
             actor_in = h_enc
 
@@ -436,6 +477,8 @@ def build_ppo_action_fn(
     arch = "transformer" if any("ray_proj" in k for k in state_dict) else "mlp"
     use_gru = any("actor_gru" in k for k in state_dict)
     use_attn_critic = any("critic_comm" in k for k in state_dict)
+    use_actor_comm = any("actor_comm" in k for k in state_dict)
+    salience_readout = any("salience_proj" in k for k in state_dict)
     gru_dim = int(state_dict["actor_gru.weight_hh"].shape[1]) if use_gru else 64
     model = ActorCriticPPO(
         obs_dim=scenario.obs_dim,
@@ -444,6 +487,8 @@ def build_ppo_action_fn(
         speed_features=scenario.speed_features,
         use_gru=use_gru,
         use_attn_critic=use_attn_critic,
+        use_actor_comm=use_actor_comm,
+        salience_readout=salience_readout,
         gru_dim=gru_dim,
     ).to(dev)
     model.load_state_dict(state_dict)
@@ -459,19 +504,22 @@ def build_ppo_action_fn(
     def _act(obs_batch: np.ndarray, phase: np.ndarray) -> np.ndarray:
         norm = rms.normalize(obs_batch)
         actor_feat = append_phase_features(norm, phase)
-        flat = actor_feat.reshape(-1, scenario.obs_dim + 2)
         with torch.inference_mode():
             if use_gru:
+                if actor_feat.ndim == 2:
+                    team_t = torch.from_numpy(actor_feat).unsqueeze(0).to(dev)
+                else:
+                    team_t = torch.from_numpy(actor_feat).to(dev)
+                e_sz, a_sz, _ = team_t.shape
                 h_cur = state["h"]
-                if h_cur is None or h_cur.shape[0] != flat.shape[0]:
-                    h_cur = torch.zeros((flat.shape[0], gru_dim), dtype=torch.float32, device=dev)
-                acts_t, next_h = model.get_deterministic_action_step(
-                    torch.from_numpy(flat).to(dev), h_cur
-                )
+                if h_cur is None or h_cur.shape != (e_sz, a_sz, gru_dim):
+                    h_cur = torch.zeros((e_sz, a_sz, gru_dim), dtype=torch.float32, device=dev)
+                acts_t, next_h = model.get_deterministic_action_team(team_t, h_cur)
                 state["h"] = next_h
                 acts = acts_t.cpu().numpy()
-            else:
-                acts = model.get_deterministic_action(torch.from_numpy(flat).to(dev)).cpu().numpy()
+                return acts[0] if obs_batch.ndim == 2 else acts
+            flat = actor_feat.reshape(-1, scenario.obs_dim + 2)
+            acts = model.get_deterministic_action(torch.from_numpy(flat).to(dev)).cpu().numpy()
         return acts.reshape(*obs_batch.shape[:-1], 2)
 
     def _reset() -> None:
@@ -490,16 +538,14 @@ def _eval_ppo_gpu_coop(
     eval_seed: int = 900_000,
 ) -> dict[str, float]:
     obs = eval_sim.reset(seed=eval_seed)
-    b_cnt, a_cnt, obs_dim = obs.shape
-    hidden = model.init_hidden((b_cnt * a_cnt,), obs.device)
+    b_cnt, a_cnt, _ = obs.shape
+    hidden = model.init_hidden((b_cnt, a_cnt), obs.device)
     last_infos: list[dict[str, float]] | None = None
     for _ in range(eval_sim.max_cycles):
         norm = obs_rms_gpu.normalize(obs)
         a_feat = append_phase_features_torch(norm, phase_t)
-        acts_flat, hidden = model.get_deterministic_action_step(
-            a_feat.reshape(-1, obs_dim + 2), hidden
-        )
-        obs, _, _, infos = eval_sim.step(acts_flat.reshape(b_cnt, a_cnt, 2))
+        acts, hidden = model.get_deterministic_action_team(a_feat, hidden)
+        obs, _, _, infos = eval_sim.step(acts)
         if infos is not None:
             last_infos = infos
     assert last_infos is not None
@@ -609,8 +655,8 @@ def _run_ppo_gpu_coop(
     update_epochs: int,
     max_grad_norm: float,
     verbose: bool,
-    team_reward_alpha: float = 0.35,
-    curriculum_frac: float = 0.20,
+    team_reward_alpha: float = 0.20,
+    curriculum_frac: float = 0.15,
 ) -> tuple[
     int,
     int,
@@ -620,14 +666,15 @@ def _run_ppo_gpu_coop(
     dict[str, torch.Tensor],
     dict[str, Any],
 ]:
-    """Cooperative CTDE MAPPO with Cross-Agent Attention Critic, GRU memory, team-reward mixing, and n_coop curriculum."""
+    """Cooperative CTDE MAPPO with Actor Comm, Attention Critic, GRU, anti-idle/anti-blob/rendezvous shaping & curriculum."""
     obs_dim = scenario.obs_dim
     n_agents = scenario.n_pursuers
     phase_t = torch.from_numpy(build_agent_phase_vec(n_agents)).to(dev)
     obs_rms = RunningMeanStdGPU((obs_dim,), dev)
 
     train_sim = VectorizedWaterworldGPU(num_envs, scenario, dev, seed=seed * 1000 + 20)
-    eval_sim = VectorizedWaterworldGPU(eval_episodes, scenario, dev, seed=900_000)
+    gpu_eval_envs = max(int(eval_episodes), 24)
+    eval_sim = VectorizedWaterworldGPU(gpu_eval_envs, scenario, dev, seed=900_000)
 
     use_curriculum = scenario.n_coop > 1 and curriculum_frac > 0.0
     curriculum_end = int(total_episodes * curriculum_frac) if use_curriculum else 0
@@ -635,6 +682,7 @@ def _run_ppo_gpu_coop(
         train_sim.set_n_coop(1)
     curriculum_switched = not use_curriculum
     alpha = team_reward_alpha if scenario.n_coop > 1 else 0.0
+    eye_a = torch.eye(n_agents, dtype=torch.float32, device=dev).unsqueeze(0)
 
     best_eval_team_ret = -float("inf")
     best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -663,6 +711,7 @@ def _run_ppo_gpu_coop(
     obs_rms.update(obs)
     hidden = model.init_hidden((num_envs, n_agents), dev)
     prev_done = torch.zeros((num_envs, n_agents), dtype=torch.float32, device=dev)
+    solo_hold = torch.zeros((num_envs, n_agents), dtype=torch.int32, device=dev)
     episodes_done = 0
     next_eval_at = eval_interval_episodes
     train_updates = 0
@@ -676,6 +725,7 @@ def _run_ppo_gpu_coop(
             obs = train_sim.reset()
             hidden = model.init_hidden((num_envs, n_agents), dev)
             prev_done.zero_()
+            solo_hold.zero_()
             if verbose:
                 print(
                     f"  [PPO-Coop:{scenario.key:11s}] curriculum switch -> n_coop={scenario.n_coop} at ep={episodes_done}",
@@ -683,7 +733,7 @@ def _run_ppo_gpu_coop(
                 )
 
         progress = min(episodes_done / max(total_episodes, 1), 1.0)
-        lr_now = initial_lr * (1.0 - 0.9 * progress)
+        lr_now = initial_lr * (1.0 - 0.75 * progress)
         for pg in optimizer.param_groups:
             pg["lr"] = lr_now
 
@@ -703,25 +753,96 @@ def _run_ppo_gpu_coop(
             buf_logprobs[t].copy_(logp_2d)
             buf_values[t].copy_(val_2d)
 
+            prev_pos = train_sim.p_pos / train_sim.PIXEL_SCALE
+            prev_hold_mask = train_sim.food_obs > 0.5
+
             clipped = torch.clamp(act_3d, -1.0, 1.0)
             norms = torch.linalg.norm(clipped, dim=-1, keepdim=True)
-            env_act = torch.where(norms < 0.06, 0.0, clipped)
+            env_act = torch.where(norms < model.deadzone, 0.0, clipped)
             next_obs, rewards, dones, infos = train_sim.step(env_act)
             c_idx = t % rms_chunk_steps
             rms_buf[c_idx].copy_(next_obs)
             if c_idx == rms_chunk_steps - 1 or t == rollout_steps - 1:
                 obs_rms.update(rms_buf[: c_idx + 1])
 
+            # Cooperative + safety training shaping (never alters pure PettingZoo eval rewards):
+            # 0) Poison avoidance: extra contact penalty + closing-velocity danger field.
+            # 1) Safety-aware anti-idle penalty cures early freezing while allowing cautious braking near poison.
+            # 2) Pair bonus + overcrowding penalty breaks 4-agent blobs into 2+2 hunting pairs.
+            # 3) Solo food-hold timeout + poison-safe rendezvous assist cures stranded food-huggers.
+            cur_pos = train_sim.p_pos / train_sim.PIXEL_SCALE
+            cur_vel = train_sim.p_vel / train_sim.PIXEL_SCALE
+            speed = torch.linalg.norm(cur_vel, dim=-1)
+            food_touch = train_sim.food_obs > 0.5
+            poison_hit = train_sim.poison_obs > 0.5
+            active_f = (speed >= 0.035).to(torch.float32)
+
             if alpha > 0.0:
-                # Asymmetric credit: keep 100% local accountability for poison/thrust penalties,
-                # while sharing positive cooperative capture rewards across the team.
                 r_pos = torch.clamp(rewards, min=0.0)
                 r_neg = torch.clamp(rewards, max=0.0)
-                train_rew = r_neg + (1.0 - alpha) * r_pos + alpha * r_pos.mean(dim=-1, keepdim=True)
+                shared_pos = r_pos.mean(dim=-1, keepdim=True) * active_f
+                train_rew = r_neg + (1.0 - alpha) * r_pos + alpha * shared_pos
             else:
-                train_rew = rewards
-            buf_rewards[t].copy_(train_rew)
+                train_rew = rewards.clone()
+
+            not_done_f = (~dones).unsqueeze(-1).to(torch.float32)
+
+            # (0) Proactive poison avoidance shaping (training-only)
+            if train_sim.n_poisons > 0:
+                cur_poi_pos = train_sim.poi_pos / train_sim.PIXEL_SCALE
+                cur_poi_vel = train_sim.poi_vel / train_sim.PIXEL_SCALE
+                rel_ap = cur_poi_pos.unsqueeze(1) - cur_pos.unsqueeze(2)
+                d_ap = torch.linalg.norm(rel_ap, dim=-1).clamp(min=1e-4)
+                d_contact = (train_sim.r_p + train_sim.r_poi) / train_sim.PIXEL_SCALE
+                safe_dist = 0.088
+                prox = torch.clamp((safe_dist - d_ap) / (safe_dist - d_contact), 0.0, 1.0)
+                rel_vel_ap = cur_vel.unsqueeze(2) - cur_poi_vel.unsqueeze(1)
+                v_close = ((rel_vel_ap * rel_ap).sum(dim=-1) / d_ap).clamp(min=0.0)
+                poi_prox_pen = (prox * prox).sum(dim=-1).clamp(max=2.5)
+                poi_close_pen = (prox * (v_close / 0.30)).sum(dim=-1).clamp(max=2.5)
+                train_rew = train_rew - (
+                    1.25 * poison_hit.to(torch.float32)
+                    + 0.015 * poi_prox_pen
+                    + 0.095 * poi_close_pen
+                ) * not_done_f
+                near_poison = d_ap.amin(dim=-1) < 0.105
+            else:
+                near_poison = torch.zeros_like(food_touch)
+
+            # (1) Safety-aware anti-idle penalty whenever stationary in open space without food
+            is_idle = (speed < 0.035) & (~food_touch) & (~near_poison)
+            train_rew = train_rew - 0.025 * is_idle.to(torch.float32) * not_done_f
+
+            if scenario.n_coop > 1 and curriculum_switched:
+                d_aa = torch.cdist(cur_pos, cur_pos) + eye_a * 10.0
+                n_near = (d_aa < 0.13).sum(dim=-1)
+                # (2) Ideal pair bonus vs 3+/4+ agent blob overcrowding penalty
+                target_partners = scenario.n_coop - 1
+                overcrowd = torch.clamp(n_near - target_partners, min=0).to(torch.float32)
+                ideal_pair = ((n_near == target_partners) & (speed >= 0.035)).to(torch.float32)
+                train_rew = train_rew + (-0.024 * overcrowd + 0.006 * ideal_pair) * not_done_f
+
+                # (3a) Stale solo food-hug penalty after > 20 consecutive steps with no partner near
+                captured = rewards >= 4.0
+                solo_now = food_touch & (~captured) & (n_near == 0) & (~dones.unsqueeze(-1))
+                solo_hold = torch.where(solo_now, solo_hold + 1, torch.zeros_like(solo_hold))
+                stale_hold = (solo_hold > 20).to(torch.float32)
+                train_rew = train_rew - 0.025 * stale_hold
+
+                # (3b) Poison-safe rendezvous assist potential shaping toward teammates holding food
+                any_holder = prev_hold_mask.any(dim=-1, keepdim=True)
+                non_holder = (~prev_hold_mask) & any_holder & (~near_poison)
+                if bool(non_holder.any()):
+                    prev_d = torch.cdist(prev_pos, prev_pos) + eye_a * 10.0
+                    mask_j = (~prev_hold_mask).unsqueeze(1).expand(-1, n_agents, -1)
+                    prev_min = torch.where(mask_j, torch.full_like(prev_d, 10.0), prev_d).amin(dim=-1)
+                    cur_min = torch.where(mask_j, torch.full_like(d_aa, 10.0), d_aa).amin(dim=-1)
+                    progress_to_holder = torch.clamp(prev_min - cur_min, -0.02, 0.03)
+                    train_rew = train_rew + 0.25 * progress_to_holder * non_holder.to(torch.float32) * not_done_f
+
             done_2d = dones.view(num_envs, 1).expand(num_envs, n_agents).to(torch.float32)
+            solo_hold = torch.where(dones.unsqueeze(-1), torch.zeros_like(solo_hold), solo_hold)
+            buf_rewards[t].copy_(train_rew)
             buf_dones[t].copy_(done_2d)
             prev_done = done_2d
             obs = next_obs
@@ -1009,8 +1130,10 @@ def train_ppo(
         speed_features=scenario.speed_features,
         use_gru=use_coop_gpu,
         use_attn_critic=use_coop_gpu,
+        use_actor_comm=use_coop_gpu,
+        salience_readout=use_coop_gpu,
     ).to(dev)
-    initial_lr = 3e-4
+    initial_lr = 3.5e-4 if use_coop_gpu else 3e-4
     optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr, eps=1e-5)
 
     rollout_steps = min(250, max(32, scenario.max_cycles // 2))

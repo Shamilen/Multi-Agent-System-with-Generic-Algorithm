@@ -1,13 +1,9 @@
-"""Generate publication-grade comparison charts for docs/ from saved experiment runs.
+"""Generate publication-grade WaterWorld comparison charts for docs/ from saved experiment runs.
 
 Reads JSON outputs from:
-  - runs/pursuit_ga_eq/{config,history,eval_summary}.json
-  - runs/pursuit_ga_transformer/{config,history,eval_summary}.json
-  - runs/pursuit_ga_coop/{config,history,eval_summary}.json
-  - runs/pursuit_behavioral_470k.json
-  - runs/waterworld/results.json
-  - runs/waterworld_tx/results.json
-  - runs/waterworld_coop/results.json
+  - runs/waterworld/results.json       (MLP + SO(2) GA)
+  - runs/waterworld_tx/results.json    (Ray-Transformer + SO(2) GA)
+  - runs/waterworld_coop/results.json  (Hybrid QMIX + PPO-Coop Comm+Attn-GRU + SO(2) GA)
 
 Usage:
   .\\venv\\Scripts\\python.exe scripts/build_research_plots.py
@@ -43,183 +39,6 @@ def _moving_avg(vals: list[float] | np.ndarray, win: int = 30) -> np.ndarray:
         s = csum[i] - (csum[start - 1] if start > 0 else 0.0)
         out[i] = s / (i - start + 1)
     return out
-
-
-def build_pursuit_comparison(runs_root: Path, out_path: Path) -> None:
-    eq_dir = runs_root / "pursuit_ga_eq"
-    tx_dir = runs_root / "pursuit_ga_transformer"
-    coop_dir = runs_root / "pursuit_ga_coop"
-
-    hist_eq = json.loads((eq_dir / "history.json").read_text(encoding="utf-8"))
-    hist_tx = json.loads((tx_dir / "history.json").read_text(encoding="utf-8"))
-    hist_coop = json.loads((coop_dir / "history.json").read_text(encoding="utf-8"))
-
-    eval_eq = json.loads((eq_dir / "eval_summary.json").read_text(encoding="utf-8"))
-    eval_tx = json.loads((tx_dir / "eval_summary.json").read_text(encoding="utf-8"))
-    eval_coop = json.loads((coop_dir / "eval_summary.json").read_text(encoding="utf-8"))
-
-    beh_path = runs_root / "pursuit_behavioral_470k.json"
-    beh = json.loads(beh_path.read_text(encoding="utf-8")) if beh_path.exists() else {}
-
-    plt.rcParams.update({"font.size": 9.3, "axes.titlesize": 10.8, "axes.titleweight": "bold"})
-    fig, axes = plt.subplots(2, 2, figsize=(16.0, 10.8), dpi=170)
-    fig.suptitle(
-        "Pursuit (sisl/pursuit-v5): C4 CNN-GRU vs C4 Vision-Transformer vs Hybrid C4 Comm-Transformer + Shaping",
-        fontsize=13.5,
-        fontweight="bold",
-        y=0.985,
-    )
-
-    gens_eq = [g["generation"] for g in hist_eq]
-    gens_tx = [g["generation"] for g in hist_tx]
-    gens_coop = [g["generation"] for g in hist_coop]
-    c_eq = "#1F6FEB"
-    c_tx = "#D97706"
-    c_coop = "#059669"
-
-    # (0, 0) Mean Agent Return over 70 generations
-    ax = axes[0, 0]
-    ax.plot(gens_eq, [g["best_return"] for g in hist_eq], color=c_eq, lw=1.9, label="eq_cnn_gru (8,954p) Best")
-    ax.plot(gens_eq, [g["mean_return"] for g in hist_eq], color=c_eq, lw=1.2, ls="--", alpha=0.65)
-    ax.plot(gens_tx, [g["best_return"] for g in hist_tx], color=c_tx, lw=1.9, label="eq_transformer (7,414p) Best")
-    ax.plot(gens_tx, [g["mean_return"] for g in hist_tx], color=c_tx, lw=1.2, ls="--", alpha=0.65)
-    ax.plot(gens_coop, [g["best_return"] for g in hist_coop], color=c_coop, lw=2.1, label="eq_comm_transformer (8,994p) Best")
-    ax.plot(gens_coop, [g["mean_return"] for g in hist_coop], color=c_coop, lw=1.3, ls="--", alpha=0.75, label="Pop Mean (dashed)")
-    ax.set_title("Training Convergence: Mean Agent Return per Episode")
-    ax.set_xlabel("Generation (pop=96, 3 ep/genome, 500 cycles)")
-    ax.set_ylabel("Mean Agent Return")
-    ax.grid(True, alpha=0.28)
-    ax.legend(loc="lower right", frameon=True, fontsize=8.2)
-
-    # (0, 1) Evaders Caught (/30) over 70 generations
-    ax = axes[0, 1]
-    ax.plot(gens_eq, [g["best_evaders_caught"] for g in hist_eq], color=c_eq, lw=1.9, label="eq_cnn_gru Best")
-    ax.plot(gens_eq, [g["mean_evaders_caught"] for g in hist_eq], color=c_eq, lw=1.2, ls="--", alpha=0.65)
-    ax.plot(gens_tx, [g["best_evaders_caught"] for g in hist_tx], color=c_tx, lw=1.9, label="eq_transformer Best")
-    ax.plot(gens_tx, [g["mean_evaders_caught"] for g in hist_tx], color=c_tx, lw=1.2, ls="--", alpha=0.65)
-    ax.plot(gens_coop, [g["best_evaders_caught"] for g in hist_coop], color=c_coop, lw=2.1, label="eq_comm_transformer Best")
-    ax.plot(gens_coop, [g["mean_evaders_caught"] for g in hist_coop], color=c_coop, lw=1.3, ls="--", alpha=0.75)
-    ax.axhline(30, color="#6B7280", ls=":", lw=1.2, label="Max Evaders (30)")
-    ax.set_ylim(0, 32)
-    ax.set_title("Training Convergence: Evaders Captured (/ 30)")
-    ax.set_xlabel("Generation")
-    ax.set_ylabel("Evaders Caught")
-    ax.grid(True, alpha=0.28)
-    ax.legend(loc="lower right", frameon=True, fontsize=8.2)
-
-    # (1, 0) Held-out 20-seed Benchmark (470000..470019)
-    ax = axes[1, 0]
-    b_eq = eval_eq["benchmarks"]
-    b_tx = eval_tx["benchmarks"]
-    b_cp = eval_coop["benchmarks"]
-    labels = [
-        "Random",
-        "Greedy",
-        "eq_cnn_gru\nArgmax",
-        "eq_cnn_gru\nStoch",
-        "eq_tx\nArgmax",
-        "eq_tx\nStoch",
-        "eq_comm_tx\nArgmax",
-        "eq_comm_tx\nStoch",
-    ]
-    caught_vals = [
-        b_eq["random"]["mean_evaders_caught"],
-        b_eq["greedy_heuristic"]["mean_evaders_caught"],
-        b_eq["trained_ga_argmax"]["mean_evaders_caught"],
-        b_eq["trained_ga_stochastic"]["mean_evaders_caught"],
-        b_tx["trained_ga_argmax"]["mean_evaders_caught"],
-        b_tx["trained_ga_stochastic"]["mean_evaders_caught"],
-        b_cp["trained_ga_argmax"]["mean_evaders_caught"],
-        b_cp["trained_ga_stochastic"]["mean_evaders_caught"],
-    ]
-    caught_stds = [
-        b_eq["random"]["std_evaders_caught"],
-        b_eq["greedy_heuristic"]["std_evaders_caught"],
-        b_eq["trained_ga_argmax"]["std_evaders_caught"],
-        b_eq["trained_ga_stochastic"]["std_evaders_caught"],
-        b_tx["trained_ga_argmax"]["std_evaders_caught"],
-        b_tx["trained_ga_stochastic"]["std_evaders_caught"],
-        b_cp["trained_ga_argmax"]["std_evaders_caught"],
-        b_cp["trained_ga_stochastic"]["std_evaders_caught"],
-    ]
-    ret_vals = [
-        b_eq["random"]["mean_agent_return"],
-        b_eq["greedy_heuristic"]["mean_agent_return"],
-        b_eq["trained_ga_argmax"]["mean_agent_return"],
-        b_eq["trained_ga_stochastic"]["mean_agent_return"],
-        b_tx["trained_ga_argmax"]["mean_agent_return"],
-        b_tx["trained_ga_stochastic"]["mean_agent_return"],
-        b_cp["trained_ga_argmax"]["mean_agent_return"],
-        b_cp["trained_ga_stochastic"]["mean_agent_return"],
-    ]
-    bar_colors = ["#9CA3AF", "#6B7280", "#60A5FA", c_eq, "#F59E0B", c_tx, "#34D399", c_coop]
-    x = np.arange(len(labels))
-    bars = ax.bar(x, caught_vals, yerr=caught_stds, capsize=3.5, color=bar_colors, edgecolor="#1F2937", linewidth=0.6)
-    ax.set_xticks(x, labels, fontsize=8.0)
-    ax.set_ylim(0, 35)
-    ax.set_ylabel("Mean Evaders Caught (/ 30)")
-    ax.set_title("Held-Out Benchmark (20 unseen seeds: 470000..470019)")
-    ax.grid(True, axis="y", alpha=0.28)
-    for bar, std, c_val, r_val in zip(bars, caught_stds, caught_vals, ret_vals):
-        pct = 100.0 * c_val / 30.0
-        ax.text(
-            bar.get_x() + bar.get_width() / 2.0,
-            bar.get_height() + std + 0.5,
-            f"{c_val:.1f}\n({pct:.0f}%)\n{r_val:+.1f}",
-            ha="center",
-            va="bottom",
-            fontsize=7.1,
-        )
-
-    # (1, 1) Cooperative Spacing (Overlaps/Step) & Action Symmetry
-    ax = axes[1, 1]
-    if beh and "eq_comm_transformer" in beh:
-        ov_labels = [
-            "eq_cnn_gru\nArgmax",
-            "eq_cnn_gru\nStoch",
-            "eq_transformer\nArgmax",
-            "eq_transformer\nStoch",
-            "eq_comm_tx\nArgmax",
-            "eq_comm_tx\nStoch",
-        ]
-        ov_vals = [
-            beh["eq_cnn_gru"]["modes"]["greedy_argmax"]["overlaps_per_step"],
-            beh["eq_cnn_gru"]["modes"]["stochastic"]["overlaps_per_step"],
-            beh["eq_transformer"]["modes"]["greedy_argmax"]["overlaps_per_step"],
-            beh["eq_transformer"]["modes"]["stochastic"]["overlaps_per_step"],
-            beh["eq_comm_transformer"]["modes"]["greedy_argmax"]["overlaps_per_step"],
-            beh["eq_comm_transformer"]["modes"]["stochastic"]["overlaps_per_step"],
-        ]
-        ov_cols = ["#60A5FA", c_eq, "#F59E0B", c_tx, "#34D399", c_coop]
-        xo = np.arange(len(ov_labels))
-        bars = ax.bar(xo, ov_vals, width=0.58, color=ov_cols, edgecolor="#1F2937", linewidth=0.7)
-        ax.set_xticks(xo, ov_labels, fontsize=8.3)
-        ax.set_ylim(0, 3.45)
-        ax.set_ylabel("Mean Agent Cell Overlaps / Step (lower = better spacing)")
-        ax.set_title("Cooperative Spatial Dispersion: 19x-20.5x Overlap Reduction")
-        ax.grid(True, axis="y", alpha=0.28)
-        for b, v in zip(bars, ov_vals):
-            ax.text(
-                b.get_x() + b.get_width() / 2.0,
-                v + 0.06,
-                f"{v:.3f}",
-                ha="center",
-                va="bottom",
-                fontsize=8.5,
-                fontweight="bold",
-            )
-        ax.annotate(
-            "All 3 C4 models maintain ~25% per direction\neq_comm_tx Stoch: [25.1%, 25.1%, 25.0%, 24.9%, 0.0%]",
-            xy=(4.5, 0.25),
-            xytext=(-0.35, 2.75),
-            fontsize=7.8,
-            bbox={"boxstyle": "round,pad=0.4", "facecolor": "#ECFDF5", "edgecolor": "#059669"},
-        )
-
-    plt.tight_layout(rect=[0, 0, 1, 0.955])
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path)
-    plt.close(fig)
 
 
 def build_waterworld_comparison(runs_root: Path, out_path: Path) -> None:
@@ -324,18 +143,20 @@ def build_waterworld_comparison(runs_root: Path, out_path: Path) -> None:
         - ww_tx["scenarios"][k]["heldout_20"]["PPO"]["mean_team_return"]
         for k in sc_keys
     ]
+    dqn_pos = sum(1 for v in dqn_delta if v > 0)
+    ppo_pos = sum(1 for v in ppo_delta if v > 0)
     w2 = 0.34
-    b1 = ax.bar(x - w2 / 2, dqn_delta, width=w2, color="#B45309", edgecolor="#1F2937", linewidth=0.6, label="DQN -> QMIX Delta (5/5 improved)")
-    b2 = ax.bar(x + w2 / 2, ppo_delta, width=w2, color="#047857", edgecolor="#1F2937", linewidth=0.6, label="PPO -> PPO-Coop Delta (3/5 improved)")
+    b1 = ax.bar(x - w2 / 2, dqn_delta, width=w2, color="#B45309", edgecolor="#1F2937", linewidth=0.6, label=f"DQN -> QMIX Delta ({dqn_pos}/5 improved)")
+    b2 = ax.bar(x + w2 / 2, ppo_delta, width=w2, color="#047857", edgecolor="#1F2937", linewidth=0.6, label=f"PPO -> PPO-Coop Delta ({ppo_pos}/5 improved)")
     for bars_g in (b1, b2):
         for b in bars_g:
             v = b.get_height()
             va = "bottom" if v >= 0 else "top"
-            pad = 0.8 if v >= 0 else -0.8
+            pad = 0.9 if v >= 0 else -0.9
             ax.text(b.get_x() + b.get_width() / 2.0, v + pad, f"{v:+.1f}", ha="center", va=va, fontsize=8.0, fontweight="bold")
     ax.axhline(0, color="#111827", lw=0.9)
     ax.set_xticks(x, sc_labels)
-    ax.set_ylim(-24, 34)
+    ax.set_ylim(-22, 68)
     ax.set_ylabel("Team Return Delta (Coop - Baseline Ray-Tx)")
     ax.set_title("C. Direct A/B Cooperation Improvement Over Baseline Ray-Transformer")
     ax.grid(True, axis="y", alpha=0.28)
@@ -355,11 +176,13 @@ def build_waterworld_comparison(runs_root: Path, out_path: Path) -> None:
     for off, (name, (vals, col)) in zip(offs5, t_series.items()):
         bars = ax.bar(x + off, vals, width=w5, label=name, color=col, edgecolor="#1F2937", linewidth=0.5)
         for b, v in zip(bars, vals):
-            ax.text(b.get_x() + b.get_width() / 2.0, v + 1.2, f"{v:.0f}s", ha="center", va="bottom", fontsize=6.9)
+            ax.text(b.get_x() + b.get_width() / 2.0, v + 2.2, f"{v:.0f}s", ha="center", va="bottom", fontsize=6.8)
+    tx_sum = sum(ww_tx["scenarios"][k]["runs"][a]["elapsed_sec"] for k in sc_keys for a in ("GA", "DQN", "PPO"))
+    cp_sum = sum(ww_coop["scenarios"][k]["runs"][a]["elapsed_sec"] for k in sc_keys for a in ("GA", "DQN", "PPO"))
     ax.set_xticks(x, sc_labels)
-    ax.set_ylim(0, 112)
+    ax.set_ylim(0, 215)
     ax.set_ylabel("Training Time per 600-ep Run (seconds)")
-    ax.set_title("D. Training Wall-Clock Time (Total 5x3: Ray-Tx 717.1s vs Coop 921.3s)")
+    ax.set_title(f"D. Training Wall-Clock Time (Total 5x3: Ray-Tx {tx_sum:.1f}s vs Coop {cp_sum:.1f}s)")
     ax.grid(True, axis="y", alpha=0.28)
     ax.legend(loc="upper left", ncol=2, frameon=True, fontsize=7.6)
 
@@ -395,7 +218,7 @@ def build_waterworld_learning_curves(runs_root: Path, out_path: Path) -> None:
         zero_ret = sc_tx["baselines"]["Zero"]["mean_team_return"]
         ax.axhline(zero_ret, color="#6B7280", ls=":", lw=1.1, label=f"Zero ({zero_ret:+.1f})")
         if sc.n_coop > 1:
-            ax.axvline(120, color="#9333EA", ls=":", lw=1.0, alpha=0.7, label="n_coop 1->2" if idx == 0 else None)
+            ax.axvline(96, color="#9333EA", ls=":", lw=1.0, alpha=0.7, label="PPO n_coop 1->2" if idx == 0 else None)
 
         curves = [
             ("GA (SO(2))", sc_mlp["runs"]["GA"], "#2563EB", "-", "o", 1.6),
@@ -431,9 +254,10 @@ def build_waterworld_learning_curves(runs_root: Path, out_path: Path) -> None:
         )
     lines.append("\nHighlights:")
     lines.append("• QMIX improves over Ray-Tx DQN on 5/5 scenarios")
-    lines.append("• PPO-Coop sets new records on base (+76.2),")
-    lines.append("  no_speed (+78.0, beats GA), and single PPO (+190.1)")
-    lines.append("• Purple dotted line: n_coop 1->2 curriculum switch")
+    lines.append("• PPO-Coop (Salience+Comm+Dodge) beats Ray-Tx on 4/5")
+    lines.append("  & hits #1 all-time base (+108.3), no_speed (+78.8),")
+    lines.append("  5-sc avg (+94.4 vs +78.7 MLP / +76.9 Ray-Tx)")
+    lines.append("• Poison hits cut 3.8x avg (more_poison: 18.1 -> 1.6)")
     ax.text(
         0.02,
         0.92,
@@ -472,29 +296,34 @@ def build_acceleration_summary(runs_root: Path, out_path: Path) -> None:
     plt.rcParams.update({"font.size": 9.3, "axes.titlesize": 10.8, "axes.titleweight": "bold"})
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15.6, 5.9), dpi=170)
     fig.suptitle(
-        "GPU & Vectorized Simulation Engineering Speedups (NVIDIA GeForce RTX 4080)",
-        fontsize=13.5,
+        "WaterWorld GPU & CUDA Graph Simulation Engineering Speedups (NVIDIA GeForce RTX 4080)",
+        fontsize=13.3,
         fontweight="bold",
         y=0.98,
     )
 
     envs = [
-        "WaterWorld\nCPU pymunk\n(NumPy sensors)",
-        "WaterWorld\nGPU CUDA Graph\n(B=1024)",
-        "Pursuit\nCPU PettingZoo\n(sisl/pursuit-v5)",
-        "Pursuit\nGPU Vectorized\n(B=288)",
+        "CPU pymunk\n(NumPy sensors)\nB=1",
+        "GPU Eager PyTorch\nVectorizedWaterworld\nB=1024",
+        "GPU CUDA Graph\nVectorizedWaterworld\nB=256",
+        "GPU CUDA Graph\nVectorizedWaterworld\nB=1024",
     ]
-    sps = [1858.0, 1_293_996.0, 322.0, 49_469.0]
-    cols = ["#9CA3AF", "#059669", "#9CA3AF", "#2563EB"]
+    sps = [1858.0, 297_793.0, 568_996.0, 1_389_224.0]
+    cols = ["#9CA3AF", "#F59E0B", "#2563EB", "#059669"]
     xb = np.arange(len(envs))
     bars = ax1.bar(xb, sps, width=0.58, color=cols, edgecolor="#1F2937", linewidth=0.7)
     ax1.set_yscale("log")
-    ax1.set_ylim(100, 6_000_000)
-    ax1.set_xticks(xb, envs, fontsize=8.6)
+    ax1.set_ylim(100, 8_000_000)
+    ax1.set_xticks(xb, envs, fontsize=8.4)
     ax1.set_ylabel("Environment Throughput (env-steps / s, log scale)")
-    ax1.set_title("A. Raw Simulator Stepping Throughput (500-cycle episodes)")
+    ax1.set_title("A. WaterWorld Simulator Throughput Scaling (base, 500 cycles)")
     ax1.grid(True, axis="y", alpha=0.28)
-    notes = ["269.1 ms/ep", "0.386 ms/ep\n696x speedup", "1,552.4 ms/ep", "10.11 ms/ep\n154x speedup"]
+    notes = [
+        "269.1 ms/ep\n1.0x baseline",
+        "1.679 ms/ep\n160x vs CPU",
+        "0.879 ms/ep\n306x vs CPU",
+        "0.360 ms/ep\n748x vs CPU (4.7x vs Eager)",
+    ]
     for b, val, note in zip(bars, sps, notes):
         ax1.text(
             b.get_x() + b.get_width() / 2.0,
@@ -502,7 +331,7 @@ def build_acceleration_summary(runs_root: Path, out_path: Path) -> None:
             f"{val:,.0f} step/s\n{note}",
             ha="center",
             va="bottom",
-            fontsize=8.0,
+            fontsize=7.8,
         )
 
     configs = [
@@ -535,7 +364,7 @@ def build_acceleration_summary(runs_root: Path, out_path: Path) -> None:
     ax2.text(0, 3250.8 + 70, "3,250.8s\n(54.2 min)", ha="center", va="bottom", fontsize=8.2, fontweight="bold")
     ax2.text(1, mlp_tot + 70, f"{mlp_tot:.1f}s\n(8.2m, 6.6x)", ha="center", va="bottom", fontsize=8.2, fontweight="bold", color="#065F46")
     ax2.text(2, tx_tot + 70, f"{tx_tot:.1f}s\n(12.0m, 4.5x)", ha="center", va="bottom", fontsize=8.2, fontweight="bold", color="#92400E")
-    ax2.text(3, cp_tot + 70, f"{cp_tot:.1f}s\n(15.4m, 3.5x)", ha="center", va="bottom", fontsize=8.2, fontweight="bold", color="#064E3B")
+    ax2.text(3, cp_tot + 70, f"{cp_tot:.1f}s\n({cp_tot/60:.1f}m, {3250.8/cp_tot:.1f}x)", ha="center", va="bottom", fontsize=8.2, fontweight="bold", color="#064E3B")
     ax2.legend(loc="upper right", ncol=2, frameon=True, fontsize=7.8)
 
     plt.tight_layout(rect=[0, 0, 1, 0.935])
@@ -547,11 +376,10 @@ def build_acceleration_summary(runs_root: Path, out_path: Path) -> None:
 def main() -> None:
     runs_root = Path("runs")
     docs_root = Path("docs")
-    build_pursuit_comparison(runs_root, docs_root / "pursuit_comparison.png")
     build_waterworld_comparison(runs_root, docs_root / "waterworld_mlp_vs_transformer.png")
     build_waterworld_learning_curves(runs_root, docs_root / "waterworld_learning_curves.png")
     build_acceleration_summary(runs_root, docs_root / "acceleration_summary.png")
-    print("Generated all 4 updated cooperative research comparison charts in docs/")
+    print("Generated all 3 WaterWorld research comparison charts in docs/")
 
 
 if __name__ == "__main__":
