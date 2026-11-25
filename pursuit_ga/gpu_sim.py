@@ -289,8 +289,13 @@ class VectorizedPursuitGPU:
                     n_flat = (cnx * self.ys + cny).reshape(self.batch_size, self.n_e * 4)
                     p_cnt = self.p_grid.gather(1, n_flat).reshape(self.batch_size, self.n_e, 4)
                     has_p = in_b & (p_cnt > 0)
+                    distinct_sides = has_p.sum(dim=-1)
                     need = self.need_surr_map[self.ex, self.ey]
-                    caught = self.ev_alive & active.unsqueeze(1) & (has_p.sum(dim=-1) == need)
+                    caught = self.ev_alive & active.unsqueeze(1) & (distinct_sides == need)
+                    flank_sides = torch.clamp(distinct_sides - 1, min=0)
+                    self.last_flank_score = (
+                        flank_sides.to(torch.float32) * (self.ev_alive & active.unsqueeze(1)).to(torch.float32)
+                    ).sum(dim=1)
 
                     self.catch_cells.zero_()
                     mark_f = (caught.unsqueeze(-1) & in_b).reshape(self.batch_size, self.n_e * 4).to(torch.float32)
@@ -301,10 +306,13 @@ class VectorizedPursuitGPU:
                     e_flat = self.ex * self.ys + self.ey
                     stacked = self.p_grid.gather(1, e_flat) >= self.cfg.n_catch
                     caught = self.ev_alive & active.unsqueeze(1) & stacked
+                    self.last_flank_score = torch.zeros(self.batch_size, dtype=torch.float32, device=self.device)
                     self.catch_cells.zero_()
                     self.catch_cells.scatter_add_(1, e_flat, caught.to(torch.float32))
                     p_flat = self.px * self.ys + self.py
                     purs_sur = self.catch_cells.gather(1, p_flat) > 0.0
+
+                self.last_overlaps = torch.clamp(self.p_grid - 1.0, min=0.0).sum(dim=1) * active_f
 
                 self.ev_alive = self.ev_alive & (~caught)
 
@@ -354,13 +362,24 @@ class BatchedPopulationPolicyGPU:
         self.device = device
         self.n_actions = 5
 
-        self.is_transformer = self.model_cfg.arch in ("transformer", "eq_transformer")
-        self.is_equivariant = self.model_cfg.arch in ("eq_cnn_gru", "eq_transformer")
+        self.has_conv_stem = self.model_cfg.arch == "eq_comm_transformer"
+        self.has_comm = self.model_cfg.arch == "eq_comm_transformer"
+        self.is_transformer = self.model_cfg.arch in (
+            "transformer",
+            "eq_transformer",
+            "eq_comm_transformer",
+        )
+        self.is_equivariant = self.model_cfg.arch in (
+            "eq_cnn_gru",
+            "eq_transformer",
+            "eq_comm_transformer",
+        )
         self.is_recurrent = self.model_cfg.arch in (
             "cnn_gru",
             "eq_cnn_gru",
             "transformer",
             "eq_transformer",
+            "eq_comm_transformer",
         )
         self.rel_coords = _build_grid_coords(env_cfg.obs_range).to(device)
         self.center_idx = (env_cfg.obs_range * env_cfg.obs_range) // 2
@@ -380,6 +399,10 @@ class BatchedPopulationPolicyGPU:
             self._tensors[sl.name] = t
 
         if self.is_transformer:
+            if self.has_conv_stem:
+                c_stem = self.model_cfg.conv_stem_channels
+                self.stem_w = self._tensors["stem_conv.0.weight"].reshape(self.P * c_stem, 3, 3, 3)
+                self.stem_b = self._tensors["stem_conv.0.bias"].reshape(self.P * c_stem)
             self.patch_w = self._tensors["patch_proj.weight"].transpose(1, 2).contiguous()
             self.patch_b = self._tensors["patch_proj.bias"].unsqueeze(1).contiguous()
             self.tx_norm_w = self._tensors["tx_norm.weight"].unsqueeze(1).contiguous()
@@ -424,6 +447,16 @@ class BatchedPopulationPolicyGPU:
             self.gru_b_ih = self._tensors["gru.bias_ih"].unsqueeze(1).contiguous()
             self.gru_w_hh = self._tensors["gru.weight_hh"].transpose(1, 2).contiguous()
             self.gru_b_hh = self._tensors["gru.bias_hh"].unsqueeze(1).contiguous()
+
+        if self.has_comm:
+            self.comm_ln_w = self._tensors["comm.ln.weight"].unsqueeze(1).contiguous()
+            self.comm_ln_b = self._tensors["comm.ln.bias"].unsqueeze(1).contiguous()
+            self.comm_qkv_w = self._tensors["comm.qkv.weight"].transpose(1, 2).contiguous()
+            self.comm_qkv_b = self._tensors["comm.qkv.bias"].unsqueeze(1).contiguous()
+            self.comm_proj_w = self._tensors["comm.proj.weight"].transpose(1, 2).contiguous()
+            self.comm_proj_b = self._tensors["comm.proj.bias"].unsqueeze(1).contiguous()
+            self.comm_out_w = self._tensors["comm.out_norm.weight"].unsqueeze(1).contiguous()
+            self.comm_out_b = self._tensors["comm.out_norm.bias"].unsqueeze(1).contiguous()
 
         if self.is_equivariant:
             self.dir_fc_w = self._tensors["dir_fc.0.weight"].transpose(1, 2).contiguous()
@@ -472,6 +505,13 @@ class BatchedPopulationPolicyGPU:
     def _run_transformer_views(self, obs_views: torch.Tensor) -> torch.Tensor:
         """Encode (P, B_v, C, H, W) grid views across P genomes cleanly using bmm + SDPA."""
         P, B_v, C, H, W = obs_views.shape
+        if self.has_conv_stem:
+            c_stem = self.model_cfg.conv_stem_channels
+            x_stem = obs_views.permute(1, 0, 2, 3, 4).reshape(B_v, P * C, H, W)
+            x_stem = self._act(F.conv2d(x_stem, self.stem_w, self.stem_b, padding=1, groups=self.P))
+            obs_views = x_stem.view(B_v, P, c_stem, H, W).transpose(0, 1).contiguous()
+            C = c_stem
+
         n_tok = H * W
         d_model = self.model_cfg.transformer_dim
         n_heads = self.model_cfg.transformer_heads
@@ -511,6 +551,27 @@ class BatchedPopulationPolicyGPU:
         tok = self._batched_ln(tok, self.tx_norm_w, self.tx_norm_b).view(P, B_v, n_tok, d_model)
         return torch.cat([tok[:, :, self.center_idx], tok.mean(dim=2)], dim=-1)
 
+    def _run_comm(self, next_h: torch.Tensor, team_size: int | None = None) -> torch.Tensor:
+        """Cross-agent Self-Attention within each (genome, episode) team: (P, E*A, gru_dim)."""
+        P, B, _ = next_h.shape
+        a_sz = (
+            team_size
+            if (team_size is not None and B % team_size == 0)
+            else (self.env_cfg.n_pursuers if B % self.env_cfg.n_pursuers == 0 else B)
+        )
+        e_sz = B // a_sz
+        c_dim = self.model_cfg.comm_dim
+        c_heads = self.model_cfg.comm_heads
+        c_hdim = c_dim // c_heads
+
+        hn = self._batched_ln(next_h, self.comm_ln_w, self.comm_ln_b)
+        qkv = (torch.bmm(hn, self.comm_qkv_w) + self.comm_qkv_b).view(P * e_sz, a_sz, 3, c_heads, c_hdim)
+        q, k, v = qkv.unbind(dim=2)
+        attn = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+        attn_flat = attn.transpose(1, 2).reshape(P, B, c_dim)
+        out = torch.bmm(attn_flat, self.comm_proj_w) + self.comm_proj_b
+        return self._batched_ln(out, self.comm_out_w, self.comm_out_b)
+
     @torch.inference_mode()
     def forward(
         self,
@@ -518,6 +579,7 @@ class BatchedPopulationPolicyGPU:
         prev_actions: torch.Tensor,  # (P, B_per_genome, 5)
         agent_phase: torch.Tensor,  # (P, B_per_genome, 2)
         hidden: torch.Tensor | None,  # (P, B_per_genome, gru_dim)
+        team_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         P, B, C, H, W = obs_chw.shape
 
@@ -544,6 +606,12 @@ class BatchedPopulationPolicyGPU:
             next_h = self._gru_step(h, hidden)
 
             dir_parts = [feat_rot, next_h.unsqueeze(2).expand(-1, -1, 4, -1)]
+            if self.has_comm:
+                comm_ctx = self._run_comm(next_h, team_size=team_size)
+                dir_parts.append(comm_ctx.unsqueeze(2).expand(-1, -1, 4, -1))
+                stay_in = torch.cat([next_h, comm_ctx], dim=-1)
+            else:
+                stay_in = next_h
             if self.model_cfg.use_prev_action:
                 dir_parts.append(rotate_prev_action_c4(prev_actions))
             if self.model_cfg.use_agent_phase:
@@ -551,7 +619,7 @@ class BatchedPopulationPolicyGPU:
             dir_in = torch.cat(dir_parts, dim=-1).reshape(P, B * 4, -1)
             dir_h = self._act(torch.bmm(dir_in, self.dir_fc_w) + self.dir_fc_b)
             dir_logits = (torch.bmm(dir_h, self.dir_head_w) + self.dir_head_b).view(P, B, 4)
-            stay_logit = torch.bmm(next_h, self.stay_head_w) + self.stay_head_b
+            stay_logit = torch.bmm(stay_in, self.stay_head_w) + self.stay_head_b
             return torch.cat([dir_logits, stay_logit], dim=-1), next_h
 
         if self.is_transformer:
@@ -589,11 +657,15 @@ class GPUPopulationEvaluator:
         env_cfg: EnvConfig,
         model_cfg: ModelConfig,
         catch_bonus_weight: float = 0.0,
+        overlap_penalty_weight: float = 0.0,
+        flank_bonus_weight: float = 0.0,
         device: torch.device | None = None,
     ) -> None:
         self.env_cfg = env_cfg
         self.model_cfg = model_cfg
         self.catch_bonus_weight = catch_bonus_weight
+        self.overlap_penalty_weight = overlap_penalty_weight
+        self.flank_bonus_weight = flank_bonus_weight
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self._sim_cache: dict[tuple[int, int], VectorizedPursuitGPU] = {}
@@ -649,11 +721,19 @@ class GPUPopulationEvaluator:
         )
         hidden = (
             torch.zeros(P, B_per_g, self.model_cfg.gru_dim, dtype=torch.float32, device=self.device)
-            if self.model_cfg.arch in ("cnn_gru", "eq_cnn_gru", "transformer", "eq_transformer")
+            if self.model_cfg.arch in (
+                "cnn_gru",
+                "eq_cnn_gru",
+                "transformer",
+                "eq_transformer",
+                "eq_comm_transformer",
+            )
             else None
         )
 
         total_team_returns = torch.zeros(P * E, dtype=torch.float32, device=self.device)
+        total_overlaps = torch.zeros(P * E, dtype=torch.float32, device=self.device)
+        total_flanks = torch.zeros(P * E, dtype=torch.float32, device=self.device)
         temp = max(self.model_cfg.temperature, 1e-4)
 
         for step_idx in range(self.env_cfg.max_cycles):
@@ -662,7 +742,9 @@ class GPUPopulationEvaluator:
             obs = sim.get_preprocessed_observations()  # (P*E, A, 3, H, W)
             obs_5d = obs.reshape(P, B_per_g, 3, self.env_cfg.obs_range, self.env_cfg.obs_range)
 
-            logits, hidden = batched_policy.forward(obs_5d, prev_actions, phase_t, hidden)
+            logits, hidden = batched_policy.forward(
+                obs_5d, prev_actions, phase_t, hidden, team_size=A
+            )
 
             if self.model_cfg.stochastic_eval:
                 probs = torch.softmax(logits / temp, dim=-1).reshape(P * B_per_g, 5)
@@ -685,6 +767,10 @@ class GPUPopulationEvaluator:
 
             rew, _ = sim.step(actions_p.reshape(P * E, A), evader_actions=ev_acts)
             total_team_returns += rew.sum(dim=1)
+            if self.overlap_penalty_weight != 0.0:
+                total_overlaps += sim.last_overlaps
+            if self.flank_bonus_weight != 0.0:
+                total_flanks += sim.last_flank_score
 
         evaders_caught = (self.env_cfg.n_evaders - sim.ev_alive.sum(dim=1)).to(torch.float32)
         cycles = sim.cycles.to(torch.float32)
@@ -695,7 +781,14 @@ class GPUPopulationEvaluator:
         caught_pe = evaders_caught.reshape(P, E).mean(dim=1)
         cycles_pe = cycles.reshape(P, E).mean(dim=1)
         clear_pe = cleared.reshape(P, E).mean(dim=1)
-        fitness_pe = mean_agent_ret_pe + self.catch_bonus_weight * caught_pe
+        overlaps_pe = (total_overlaps / cycles.clamp(min=1.0)).reshape(P, E).mean(dim=1)
+        flanks_pe = (total_flanks / cycles.clamp(min=1.0)).reshape(P, E).mean(dim=1)
+        fitness_pe = (
+            mean_agent_ret_pe
+            + self.catch_bonus_weight * caught_pe
+            - self.overlap_penalty_weight * overlaps_pe
+            + self.flank_bonus_weight * flanks_pe
+        )
 
         return PopulationEvaluation(
             fitnesses=fitness_pe.cpu().numpy().astype(np.float32),

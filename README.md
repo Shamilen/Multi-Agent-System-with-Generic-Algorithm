@@ -13,8 +13,8 @@
 
 | Проект / Среда | Алгоритмы | Сравниваемые архитектуры | Симметрия / Инвариантность | Симулятор обучения (RTX 4080) | Проверка качества |
 | --- | --- | --- | --- | --- | --- |
-| **Pursuit** (`sisl/pursuit-v5`, 8 преследователей, 30 целей) | Генетический алгоритм (`GeneticAlgorithm`, `pop=96`, `70` поколений) | `eq_transformer` (`7,414` пар.) vs `eq_cnn_gru` (`8,954` пар.) + неэквивариантные `cnn`, `cnn_gru`, `transformer` | Точная **C4-эквивариантность** (повороты `90°`, `rotate_obs_c4` / `rotate_prev_action_c4` / `rotate_agent_phase_c4`) | [`VectorizedPursuitGPU`](pursuit_ga/gpu_sim.py) (`49,469 env-steps/s`, `154×` vs CPU) | 20 held-out сидов `470000..470019` на официальной CPU-среде PettingZoo |
-| **WaterWorld** (`waterworld`, 5 сценариев × 3 метода, `600` эпизодов) | `GA (SO(2) + CRN)`, `9-action 5-step Dueling Double DQN`, `CTDE MAPPO` | [`RayTransformerEncoder`](waterworld_marl/algos/common.py) (`10.3K–18.9K`) vs `MLP` (`29.2K–128.1K`) vs [`WaterworldGAPolicy`](waterworld_marl/algos/ga.py) (`11–17` пар.) | Геометрический `[cos θ, sin θ]` readout в Transformer; точная **SO(2)-эквивариантность** в GA | [`VectorizedWaterworldGPU`](waterworld_marl/env/gpu_waterworld.py) CUDA Graph (`1,293,996 env-steps/s`, `696×` vs `pymunk`) | 20 held-out сидов `950000..950019` на `pymunk`-среде PettingZoo |
+| **Pursuit** (`sisl/pursuit-v5`, 8 преследователей, 30 целей) | Генетический алгоритм (`GeneticAlgorithm`, `pop=96`, `70` поколений) + anti-overlap/flank shaping | `eq_comm_transformer` (`8,994` пар.) vs `eq_transformer` (`7,414`) vs `eq_cnn_gru` (`8,954`) + неэквивариантные `cnn`, `cnn_gru`, `transformer` | Точная **C4-эквивариантность** + межагентный Self-Attention ([`_AgentCommBlock`](pursuit_ga/networks.py)) | [`VectorizedPursuitGPU`](pursuit_ga/gpu_sim.py) (`49,469 env-steps/s`, `154×` vs CPU) | 20 held-out сидов `470000..470019` на официальной CPU-среде PettingZoo |
+| **WaterWorld** (`waterworld`, 5 сценариев × 3 метода, `600` эпизодов) | `GA (SO(2) + CRN)`, `Double DQN` / **Hybrid QMIX**, `CTDE MAPPO` / **PPO-Coop (Attn-GRU + curriculum)** | [`RayTransformerEncoder`](waterworld_marl/algos/common.py) (`10.3K–18.9K`) vs `MLP` (`29.2K–128.1K`) vs [`WaterworldGAPolicy`](waterworld_marl/algos/ga.py) (`11–17` пар.) | Геометрический `[cos θ, sin θ]` readout + Cross-Agent Critic; точная **SO(2)-эквивариантность** в GA | [`VectorizedWaterworldGPU`](waterworld_marl/env/gpu_waterworld.py) CUDA Graph (`1,293,996 env-steps/s`, `696×` vs `pymunk`) | 20 held-out сидов `950000..950019` на `pymunk`-среде PettingZoo |
 
 ---
 
@@ -37,27 +37,29 @@
 | Greedy Heuristic | `—` | `-44.01 ± 0.57` | `0.00 / 30` | `0.0%` | `0.0%` | `—` |
 | `eq_transformer` (`Greedy Argmax`, default) | **`7,414`** | `-19.42 ± 3.98` | **`23.90 / 30`** | **`79.7%`** | **`5.0%`** | `2.246` |
 | `eq_transformer` (`Stochastic T=0.15`) | `7,414` | `-20.17 ± 2.44` | `23.30 / 30` | `77.7%` | `0.0%` | `2.909` |
-| **`eq_cnn_gru` (`Stochastic T=0.15`)** | `8,954` | **`-17.40 ± 2.63`** | **`24.65 / 30`** | **`82.2%`** | `0.0%` | **`0.223`** |
+| **`eq_cnn_gru` (`Stochastic T=0.15`)** | `8,954` | **`-17.40 ± 2.63`** | **`24.65 / 30`** | **`82.2%`** | `0.0%` | `0.223` |
 | `eq_cnn_gru` (`Greedy Argmax`) | `8,954` | `-18.31 ± 4.56` | `22.45 / 30` | `74.8%` | `0.0%` | `0.641` |
+| **`eq_comm_transformer` (`Argmax`, Coop)** | `8,994` | `-19.47 ± 3.12` | `23.40 / 30` | `78.0%` | `0.0%` | **`0.118`** |
+| **`eq_comm_transformer` (`Stoch T=0.15`, Coop)** | `8,994` | `-19.74 ± 2.82` | `23.55 / 30` | `78.5%` | `0.0%` | **`0.142`** |
 
-- `eq_transformer` компактнее на `17.2%` и выигрывает в детерминированном `Argmax`-режиме (`79.7%` поимок, единственная модель с `5.0%` полного зачищения карты и `0` пропусков `STAY`), тогда как `eq_cnn_gru` лучше держит дистанцию между преследователями (`0.223` перекрытий за шаг) и достигает максимума `82.2%` при `T=0.15`.
+- Гибридный **`eq_comm_transformer`** (`3×3` conv-стем + C4 Vision-Transformer + межагентный Self-Attention + anti-overlap/flank shaping) сократил перекрытия агентов в **`19×–20.5×`** относительно `eq_transformer` (`2.246 → 0.118` Argmax, `2.909 → 0.142` Stochastic — лучший показатель среди всех моделей), улучшил стохастический возврат и GIF (`22/30`, `-20.78`), сохранив идеальный баланс направлений `[25.1%, 25.1%, 25.0%, 24.9%, 0.0%]`.
 
-### 3. WaterWorld: `MLP` vs `RayTransformerEncoder` vs `SO(2) GA`
+### 3. WaterWorld: `MLP` vs `Ray-Transformer` vs Кооперативные `Hybrid QMIX` и `PPO-Coop`
 
-![Сравнение WaterWorld MLP vs Ray-Transformer](docs/waterworld_mlp_vs_transformer.png)
+![Сравнение WaterWorld MLP vs Ray-Transformer vs Coop](docs/waterworld_mlp_vs_transformer.png)
 
-Командная награда **`mean_team_return`** на 20 held-out сидах `pymunk` (`mean_agent_return` и `food / poison` — в [`docs/RESEARCH_REPORT.md`](docs/RESEARCH_REPORT.md)):
+Командная награда **`mean_team_return`** на 20 held-out сидах `pymunk` (`food / poison` и кривые обучения — в [`docs/RESEARCH_REPORT.md`](docs/RESEARCH_REPORT.md)):
 
-| Сценарий | Zero / Random | GA (`SO(2)`) | DQN (`MLP`) | DQN (`Ray-Tx`) | PPO (`MLP`) | PPO (`Ray-Tx`) | Победитель |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `base` (`5 ag, 30s`) | `-2.25` / `-563.18` | `+28.12 ± 49.44` | **`+11.08`** | `+4.87` | **`+68.88 ± 33.79`** | `+51.07 ± 32.28` | **PPO (MLP)** |
-| `single` (`1 ag, 30s`) | `+23.78` / `-143.79` | **`+231.12 ± 53.32`** | `+162.11` | **`+193.86`** | `+173.95` | **`+179.12`** | **GA (SO(2))**, Tx > MLP |
-| `no_speed` (`5 ag, 152d`) | `-2.25` / `-563.18` | **`+70.18 ± 39.86`** | **`+3.75`** | `-1.02` | `+57.51` | **`+69.42 ± 30.70`** | **GA / PPO (Ray-Tx)** |
-| `few_sensors` (`5 ag, 10s`) | `-2.25` / `-563.18` | `+60.32 ± 32.39` | `+0.98` | **`+4.02`** | `+60.54` | **`+63.59 ± 46.14`** | **PPO (Ray-Tx)** |
-| `more_poison` (`3f / 25p`) | `-12.57` / `-584.55` | **`+33.76 ± 30.50`** | `-9.33` | **`-3.67`** | **`+32.53 ± 27.89`** | `+21.26 ± 32.10` | **GA / PPO (MLP)** |
+| Сценарий | GA (`SO(2)`) | DQN (`MLP`) | DQN (`Ray-Tx`) | **QMIX (`Coop-Tx`)** | PPO (`MLP`) | PPO (`Ray-Tx`) | **PPO-Coop (`Attn-GRU`)** | Победитель |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `base` (`5 ag, 30s`) | `+28.12` | `+11.08` | `+4.87` | **`+8.24`** | `+68.88` | `+51.07` | **`+76.20`** | **PPO-Coop (рекорд!)** |
+| `single` (`1 ag, 30s`) | **`+231.12`** | `+162.11` | `+193.86` | **`+195.07`** | `+173.95` | `+179.12` | **`+190.05`** | **GA**, QMIX & PPO-Coop > Tx/MLP |
+| `no_speed` (`5 ag, 152d`) | `+70.18` | `+3.75` | `-1.02` | **`+8.58`** | `+57.51` | `+69.42` | **`+78.00`** | **PPO-Coop (рекорд!)** |
+| `few_sensors` (`5 ag, 10s`) | `+60.32` | `+0.98` | `+4.02` | **`+11.48`** | `+60.54` | **`+63.59`** | `+46.58` | **PPO (Ray-Tx)**, QMIX > DQN |
+| `more_poison` (`3f / 25p`) | **`+33.76`** | `-9.33` | `-3.67` | **`-1.04`** | `+32.53` | `+21.26` | `+18.16` | **GA / PPO (MLP)**, QMIX > DQN |
 
-- **Геометрический `RayTransformerEncoder`** сократил число параметров в **`4.8×` (DQN)** и **`6.8×` (PPO)**, обеспечил инвариантность размера сети к числу сенсорных лучей (`n_sensors=10` и `30`) и обошёл MLP на **`single`**, **`no_speed PPO`**, **`few_sensors DQN/PPO`** и **`more_poison DQN`**.
-- **Классический `MLP`** остаётся быстрее в градиентном шаге (`491.9s` против `717.1s`) и точнее избегает яда при плотной многоагентной координации (`base PPO`, `more_poison PPO`).
+- **Hybrid Local + QMIX** превзошёл базовый `Ray-Tx DQN` на **всех 5 сценариях из 5** (`5/5`), подняв число захватов еды в `10×–12×` на `few_sensors` (`1.0 → 10.0`) и `no_speed` (`0.9 → 11.2`).
+- **PPO-Coop** (`Cross-Agent Attention Critic + GRU + асимметричное кредитование + curriculum n_coop: 1→2`) установил абсолютные рекорды на **`base` (`+76.20`)** и **`no_speed` (`+78.00`, обогнав GA)** и лучший результат PPO на **`single` (`+190.05`)**.
 
 ---
 
@@ -68,15 +70,15 @@
 ```powershell
 $env:PYTHONIOENCODING="utf-8"
 
-# 1. Прогон всех 32 автотестов (C4-эквивариантность, паритет GPU-симуляторов с PettingZoo, smoke-тесты)
+# 1. Прогон всех 36 автотестов (C4-эквивариантность, монотонность QMIX, паритет GPU-симуляторов с PettingZoo)
 .\venv\Scripts\python.exe -m pytest -v
 
-# 2. Обучение Pursuit GA (70 поколений на RTX 4080, --arch eq_transformer или eq_cnn_gru)
-.\venv\Scripts\python.exe -u -m pursuit_ga.train --device cuda --arch eq_transformer --output-dir runs/pursuit_ga_transformer
-.\venv\Scripts\python.exe -u -m pursuit_ga.evaluate --checkpoint runs/pursuit_ga_transformer/best_model.pt --episodes 20 --seed-start 470000 --deterministic --save-gif runs/pursuit_ga_transformer/eval_pursuit.gif
+# 2. Обучение Pursuit GA (70 поколений на RTX 4080; --arch eq_comm_transformer / eq_transformer / eq_cnn_gru)
+.\venv\Scripts\python.exe -u -m pursuit_ga.train --device cuda --arch eq_comm_transformer --overlap-penalty 1.0 --flank-bonus 0.5 --output-dir runs/pursuit_ga_coop
+.\venv\Scripts\python.exe -u -m pursuit_ga.evaluate --checkpoint runs/pursuit_ga_coop/best_model.pt --episodes 20 --seed-start 470000 --save-gif runs/pursuit_ga_coop/eval_pursuit.gif
 
-# 3. Полная матрица WaterWorld (5 сценариев x 3 алгоритма, --arch transformer или mlp)
-.\venv\Scripts\python.exe -m waterworld_marl.run_experiments --episodes 600 --eval-interval 100 --eval-episodes 8 --heldout-episodes 20 --device cuda --arch transformer --out-dir runs/waterworld_tx
+# 3. Полная матрица WaterWorld (5 сценариев x 3 алгоритма; --coop включает Hybrid QMIX + PPO-Coop Attn-GRU + curriculum)
+.\venv\Scripts\python.exe -m waterworld_marl.run_experiments --episodes 600 --eval-interval 100 --eval-episodes 8 --heldout-episodes 20 --device cuda --arch transformer --coop --out-dir runs/waterworld_coop
 
 # 4. Пересборка сравнительных графиков в docs/ из сохранённых запусков в runs/
 .\venv\Scripts\python.exe scripts/build_research_plots.py
@@ -112,5 +114,5 @@ $env:PYTHONIOENCODING="utf-8"
 │   ├── run_experiments.py             # Единый CLI для матрицы 5x3, графиков и GIF
 │   ├── env/                           # PettingZoo pymunk (NumPy-сенсоры) и CUDA Graph симулятор VectorizedWaterworldGPU
 │   └── algos/                         # RayTransformerEncoder, DuelingQNet (DQN), ActorCriticPPO (MAPPO), WaterworldGAPolicy (SO(2) GA)
-└── tests/                             # 32 автотеста (эквивалентность CPU/GPU, C4-симметрия, smoke-проверки)
+└── tests/                             # 36 автотестов (эквивалентность CPU/GPU, C4-симметрия, QMIX, smoke-проверки)
 ```

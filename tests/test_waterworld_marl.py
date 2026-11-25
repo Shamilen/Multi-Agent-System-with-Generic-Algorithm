@@ -5,10 +5,11 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from waterworld_marl.algos.dqn import build_dqn_action_fn, train_double_dqn
+from waterworld_marl.algos.dqn import QMixerNet, build_dqn_action_fn, train_double_dqn
 from waterworld_marl.algos.ga import WaterworldGAPolicy, build_ga_action_fn, train_ga
 from waterworld_marl.algos.ga_worker import build_sensor_basis, numpy_equivariant_forward
 from waterworld_marl.algos.ppo import build_ppo_action_fn, train_ppo
+from waterworld_marl.env.gpu_waterworld import VectorizedWaterworldGPU
 from waterworld_marl.scenarios import (
     SCENARIOS,
     SubprocWaterworldVecEnv,
@@ -188,3 +189,92 @@ def test_equivariant_ga_numpy_matches_torch() -> None:
         with torch.no_grad():
             act_dir = model_dir(torch.from_numpy(o_ray)).numpy()[0]
         assert abs(float(act_dir[0])) < 1e-5 and float(act_dir[1]) > 0.15
+
+
+def test_qmix_monotonicity_and_coop_smoke() -> None:
+    """Verify QMIX monotonicity (dQ_tot/dQ_i >= 0), CUDA curriculum switch, and coop QMIX/PPO smoke."""
+    mixer = QMixerNet(n_agents=5, state_dim=40, embed_dim=16)
+    qs = torch.randn(8, 5, requires_grad=True)
+    state = torch.randn(8, 40)
+    q_tot = mixer(qs, state)
+    assert q_tot.shape == (8,)
+    q_tot.sum().backward()
+    assert qs.grad is not None
+    assert torch.all(qs.grad >= -1e-7)
+
+    tiny_coop = WaterworldScenario(
+        key="tiny_coop",
+        title_ru="TinyCoop",
+        n_pursuers=3,
+        n_evaders=3,
+        n_poisons=3,
+        n_coop=2,
+        n_sensors=10,
+        speed_features=True,
+        max_cycles=30,
+    )
+    dev_str = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = torch.device(dev_str)
+
+    # Verify set_n_coop works cleanly across CUDA Graph replays
+    sim = VectorizedWaterworldGPU(4, tiny_coop, dev, seed=7, use_cuda_graph=(dev.type == "cuda"))
+    sim.reset()
+    zeros = torch.zeros((4, 3, 2), device=dev)
+    sim.set_n_coop(1)
+    for _ in range(4):
+        obs, rew, _, _ = sim.step(zeros)
+        assert torch.all(torch.isfinite(obs)) and torch.all(torch.isfinite(rew))
+    sim.set_n_coop(2)
+    for _ in range(4):
+        obs, rew, _, _ = sim.step(zeros)
+        assert torch.all(torch.isfinite(obs)) and torch.all(torch.isfinite(rew))
+
+    phase = build_agent_phase_vec(tiny_coop.n_pursuers)
+    dummy_obs = np.zeros((3, tiny_coop.obs_dim), dtype=np.float32)
+
+    qmix_res = train_double_dqn(
+        tiny_coop,
+        total_episodes=6,
+        num_envs=2,
+        eval_interval_episodes=6,
+        eval_episodes=2,
+        seed=2,
+        device=dev_str,
+        verbose=False,
+        warmup_transitions=30,
+        coop_mode=True,
+    )
+    assert qmix_res["total_episodes"] == 6
+    assert np.isfinite(qmix_res["best_eval"]["mean_team_return"])
+    qmix_fn = build_dqn_action_fn(
+        tiny_coop, qmix_res["state_dict"], obs_rms_state=qmix_res["obs_rms_state"], device=dev_str
+    )
+    assert qmix_fn(dummy_obs, phase).shape == (3, 2)
+
+    ppo_coop_res = train_ppo(
+        tiny_coop,
+        total_episodes=6,
+        num_envs=2,
+        eval_interval_episodes=6,
+        eval_episodes=2,
+        seed=2,
+        device=dev_str,
+        verbose=False,
+        arch="transformer",
+        coop_mode=True,
+    )
+    assert ppo_coop_res["total_episodes"] == 6
+    assert ppo_coop_res["train_updates"] > 0
+    assert np.isfinite(ppo_coop_res["best_eval"]["mean_team_return"])
+    if dev.type == "cuda":
+        assert any("actor_gru" in k for k in ppo_coop_res["state_dict"])
+        assert any("critic_comm" in k for k in ppo_coop_res["state_dict"])
+    ppo_fn = build_ppo_action_fn(
+        tiny_coop, ppo_coop_res["state_dict"], ppo_coop_res["obs_rms_state"], device=dev_str
+    )
+    if hasattr(ppo_fn, "reset"):
+        ppo_fn.reset()
+    a1 = ppo_fn(dummy_obs, phase)
+    a2 = ppo_fn(dummy_obs, phase)
+    assert a1.shape == (3, 2) and a2.shape == (3, 2)
+    assert np.all(np.isfinite(a1)) and np.all(np.isfinite(a2))

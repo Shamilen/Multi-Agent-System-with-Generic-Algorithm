@@ -272,6 +272,8 @@ def rollout_single_episode(
     env = make_waterworld_env(scenario, render_mode="rgb_array" if capture_frames else None)
     try:
         obs_dict, _ = env.reset(seed=int(seed))
+        if hasattr(action_fn, "reset"):
+            action_fn.reset()
         agent_ids = list(env.possible_agents)
         phase = build_agent_phase_vec(len(agent_ids))
         team_ret = 0.0
@@ -330,6 +332,8 @@ def evaluate_policy_parallel(
         # Pad chunk to vec_env.num_envs and ignore padded slots
         padded = chunk + [chunk[-1]] * (vec_env.num_envs - len(chunk))
         obs = vec_env.reset(padded)
+        if hasattr(action_fn, "reset"):
+            action_fn.reset()
         done_mask = np.zeros(vec_env.num_envs, dtype=bool)
         for _ in range(scenario.max_cycles):
             acts = np.clip(action_fn(obs, phase), -1.0, 1.0).astype(np.float32)

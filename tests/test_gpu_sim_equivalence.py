@@ -74,7 +74,10 @@ def test_gpu_simulator_matches_pettingzoo_step_by_step(shared_reward: bool) -> N
         pz_env.close()
 
 
-@pytest.mark.parametrize("arch", ["cnn", "cnn_gru", "eq_cnn_gru", "transformer", "eq_transformer"])
+@pytest.mark.parametrize(
+    "arch",
+    ["cnn", "cnn_gru", "eq_cnn_gru", "transformer", "eq_transformer", "eq_comm_transformer"],
+)
 def test_batched_population_policy_matches_single_policy(arch: str) -> None:
     """Verify BatchedPopulationPolicyGPU logits & hidden states match PursuitPolicyNet."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -94,15 +97,15 @@ def test_batched_population_policy_matches_single_policy(arch: str) -> None:
     phase = torch.from_numpy(build_agent_phase_features(8)).to(device).repeat(2, 1).unsqueeze(0).expand(pop_size, -1, -1)
     hidden = (
         torch.zeros(pop_size, B_per_g, model_cfg.gru_dim, device=device)
-        if arch in ("cnn_gru", "eq_cnn_gru", "transformer", "eq_transformer")
+        if arch in ("cnn_gru", "eq_cnn_gru", "transformer", "eq_transformer", "eq_comm_transformer")
         else None
     )
 
-    b_logits, b_hidden = batched.forward(obs, prev, phase, hidden)
+    b_logits, b_hidden = batched.forward(obs, prev, phase, hidden, team_size=8)
 
     for p_idx, net in enumerate(nets):
         h_single = hidden[p_idx] if hidden is not None else None
-        s_logits, s_hidden = net(obs[p_idx], prev[p_idx], phase[p_idx], h_single)
+        s_logits, s_hidden = net(obs[p_idx], prev[p_idx], phase[p_idx], h_single, team_size=8)
         assert torch.allclose(b_logits[p_idx], s_logits, atol=1e-3)
         if b_hidden is not None and s_hidden is not None:
             assert torch.allclose(b_hidden[p_idx], s_hidden, atol=1e-3)

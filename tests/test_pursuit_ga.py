@@ -35,7 +35,10 @@ def test_env_creation_and_preprocessing() -> None:
         env.close()
 
 
-@pytest.mark.parametrize("arch", ["cnn", "cnn_gru", "eq_cnn_gru", "transformer", "eq_transformer"])
+@pytest.mark.parametrize(
+    "arch",
+    ["cnn", "cnn_gru", "eq_cnn_gru", "transformer", "eq_transformer", "eq_comm_transformer"],
+)
 def test_policy_genome_roundtrip_and_forward(arch: str) -> None:
     model_cfg = ModelConfig(arch=arch)
     net = PursuitPolicyNet(model_cfg=model_cfg, obs_range=7, n_actions=5)
@@ -55,14 +58,14 @@ def test_policy_genome_roundtrip_and_forward(arch: str) -> None:
 
     logits, next_hidden = net(obs, prev, phase, hidden)
     assert logits.shape == (8, 5)
-    if arch in ("cnn_gru", "eq_cnn_gru", "transformer", "eq_transformer"):
+    if arch in ("cnn_gru", "eq_cnn_gru", "transformer", "eq_transformer", "eq_comm_transformer"):
         assert next_hidden is not None
         assert next_hidden.shape == (8, model_cfg.gru_dim)
     else:
         assert next_hidden is None
 
 
-@pytest.mark.parametrize("arch", ["eq_cnn_gru", "eq_transformer"])
+@pytest.mark.parametrize("arch", ["eq_cnn_gru", "eq_transformer", "eq_comm_transformer"])
 def test_eq_cnn_gru_exact_c4_equivariance(arch: str) -> None:
     """Rotating spatial observation, prev_action, and agent_phase permutes action logits exactly."""
     torch.manual_seed(123)

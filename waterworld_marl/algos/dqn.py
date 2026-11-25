@@ -82,6 +82,45 @@ class DuelingQNet(nn.Module):
         return v + (a - a.mean(dim=-1, keepdim=True))
 
 
+class QMixerNet(nn.Module):
+    """Monotonic QMIX hypernetwork mixing per-agent Q-values into joint team Q_tot.
+
+    Non-negative weights (`torch.abs`) + ELU guarantee dQ_tot / dQ_i >= 0 everywhere,
+    preserving Individual-Global-Max (IGM) for fully decentralized greedy execution.
+    """
+
+    def __init__(self, n_agents: int, state_dim: int, embed_dim: int = 16) -> None:
+        super().__init__()
+        self.n_agents = int(n_agents)
+        self.state_dim = int(state_dim)
+        self.embed_dim = int(embed_dim)
+        self.hyper_w1 = nn.Sequential(
+            nn.Linear(self.state_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, self.n_agents * self.embed_dim),
+        )
+        self.hyper_b1 = nn.Linear(self.state_dim, self.embed_dim)
+        self.hyper_w2 = nn.Sequential(
+            nn.Linear(self.state_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, self.embed_dim),
+        )
+        self.hyper_v = nn.Sequential(
+            nn.Linear(self.state_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+        )
+
+    def forward(self, agent_qs: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        bsz = agent_qs.shape[0]
+        w1 = torch.abs(self.hyper_w1(state)).view(bsz, self.n_agents, self.embed_dim)
+        b1 = self.hyper_b1(state).view(bsz, 1, self.embed_dim)
+        hidden = F.elu(torch.bmm(agent_qs.unsqueeze(1), w1) + b1)
+        w2 = torch.abs(self.hyper_w2(state)).view(bsz, self.embed_dim, 1)
+        v = self.hyper_v(state).view(bsz, 1, 1)
+        return (torch.bmm(hidden, w2) + v).squeeze(-1).squeeze(-1)
+
+
 class ReplayBuffer:
     """Pre-allocated NumPy circular replay buffer storing N-step transitions."""
 
@@ -278,6 +317,173 @@ class ReplayBufferGPU:
             self.next_obs[idx],
             self.boot_gammas[idx],
         )
+
+
+class TeamReplayBufferGPU:
+    """Device-resident joint team replay buffer storing both per-agent and team N-step returns."""
+
+    def __init__(self, capacity: int, n_agents: int, in_dim: int, device: torch.device) -> None:
+        self.capacity = capacity
+        self.n_agents = n_agents
+        self.device = device
+        self.obs = torch.zeros((capacity, n_agents, in_dim), dtype=torch.float32, device=device)
+        self.actions = torch.zeros((capacity, n_agents), dtype=torch.int64, device=device)
+        self.agent_returns = torch.zeros((capacity, n_agents), dtype=torch.float32, device=device)
+        self.team_returns = torch.zeros((capacity,), dtype=torch.float32, device=device)
+        self.next_obs = torch.zeros((capacity, n_agents, in_dim), dtype=torch.float32, device=device)
+        self.boot_gammas = torch.zeros((capacity,), dtype=torch.float32, device=device)
+        self.ptr = 0
+        self.size = 0
+
+    def clear(self) -> None:
+        self.ptr = 0
+        self.size = 0
+
+    @torch.no_grad()
+    def add_batch(
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+        agent_returns: torch.Tensor,
+        team_returns: torch.Tensor,
+        next_obs: torch.Tensor,
+        boot_gammas: torch.Tensor,
+    ) -> None:
+        n = int(team_returns.shape[0])
+        if n == 0:
+            return
+        if n >= self.capacity:
+            obs = obs[-self.capacity :]
+            actions = actions[-self.capacity :]
+            agent_returns = agent_returns[-self.capacity :]
+            team_returns = team_returns[-self.capacity :]
+            next_obs = next_obs[-self.capacity :]
+            boot_gammas = boot_gammas[-self.capacity :]
+            n = self.capacity
+        end = self.ptr + n
+        if end <= self.capacity:
+            self.obs[self.ptr : end].copy_(obs)
+            self.actions[self.ptr : end].copy_(actions)
+            self.agent_returns[self.ptr : end].copy_(agent_returns)
+            self.team_returns[self.ptr : end].copy_(team_returns)
+            self.next_obs[self.ptr : end].copy_(next_obs)
+            self.boot_gammas[self.ptr : end].copy_(boot_gammas)
+        else:
+            first = self.capacity - self.ptr
+            rem = n - first
+            self.obs[self.ptr :].copy_(obs[:first])
+            self.actions[self.ptr :].copy_(actions[:first])
+            self.agent_returns[self.ptr :].copy_(agent_returns[:first])
+            self.team_returns[self.ptr :].copy_(team_returns[:first])
+            self.next_obs[self.ptr :].copy_(next_obs[:first])
+            self.boot_gammas[self.ptr :].copy_(boot_gammas[:first])
+            self.obs[:rem].copy_(obs[first:])
+            self.actions[:rem].copy_(actions[first:])
+            self.agent_returns[:rem].copy_(agent_returns[first:])
+            self.team_returns[:rem].copy_(team_returns[first:])
+            self.next_obs[:rem].copy_(next_obs[first:])
+            self.boot_gammas[:rem].copy_(boot_gammas[first:])
+        self.ptr = (self.ptr + n) % self.capacity
+        self.size = min(self.size + n, self.capacity)
+
+    def sample(self, batch_size: int) -> tuple[torch.Tensor, ...]:
+        idx = torch.randint(0, self.size, (batch_size,), device=self.device)
+        return (
+            self.obs[idx],
+            self.actions[idx],
+            self.agent_returns[idx],
+            self.team_returns[idx],
+            self.next_obs[idx],
+            self.boot_gammas[idx],
+        )
+
+
+def _build_team_state(obs_feat: torch.Tensor) -> torch.Tensor:
+    """Permutation-invariant global team state `(B, 2*obs_dim)` from `(B, A, obs_dim+2)`."""
+    raw = obs_feat[..., :-2]
+    return torch.cat([raw.mean(dim=1), raw.amax(dim=1)], dim=-1)
+
+
+def _qmix_update_step(
+    q_net: DuelingQNet,
+    target_net: DuelingQNet,
+    mixer: QMixerNet,
+    target_mixer: QMixerNet,
+    optimizer: torch.optim.Optimizer,
+    online_params: list[torch.Tensor],
+    target_params: list[torch.Tensor],
+    b_s: torch.Tensor,
+    b_a: torch.Tensor,
+    b_r_ag: torch.Tensor,
+    b_r_team: torch.Tensor,
+    b_ns: torch.Tensor,
+    b_bg: torch.Tensor,
+    tau: float,
+    qmix_weight: float = 0.35,
+) -> None:
+    """Hybrid Local-Accountable + Monotonic QMIX TD update.
+
+    Preserves exact per-agent poison/thrust accountability via `b_r_ag` while
+    propagating cooperative joint-capture credit through monotonic `QMixerNet`.
+    """
+    bsz, n_ag, in_dim = b_s.shape
+    g_s = _build_team_state(b_s)
+    g_ns = _build_team_state(b_ns)
+
+    q_all = q_net(b_s.reshape(bsz * n_ag, in_dim)).reshape(bsz, n_ag, -1)
+    chosen_q = q_all.gather(2, b_a.unsqueeze(-1)).squeeze(-1)
+    q_tot = mixer(chosen_q, g_s)
+
+    with torch.no_grad():
+        next_best_a = torch.argmax(
+            q_net(b_ns.reshape(bsz * n_ag, in_dim)), dim=-1
+        ).reshape(bsz, n_ag, 1)
+        t_q_all = target_net(b_ns.reshape(bsz * n_ag, in_dim)).reshape(bsz, n_ag, -1)
+        next_q = t_q_all.gather(2, next_best_a).squeeze(-1)
+        target_ag = b_r_ag + b_bg.unsqueeze(1) * next_q
+        target_q_tot = target_mixer(next_q, g_ns)
+        target_team = b_r_team + b_bg * target_q_tot
+
+    loss_local = F.smooth_l1_loss(chosen_q, target_ag, beta=1.0)
+    loss_qmix = F.smooth_l1_loss(q_tot, target_team, beta=2.0) / float(max(n_ag, 1))
+    loss = (1.0 - qmix_weight) * loss_local + qmix_weight * loss_qmix
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    nn.utils.clip_grad_norm_(list(q_net.parameters()) + list(mixer.parameters()), 10.0)
+    optimizer.step()
+    with torch.no_grad():
+        torch._foreach_mul_(target_params, 1.0 - tau)
+        torch._foreach_add_(target_params, online_params, alpha=tau)
+
+
+@torch.no_grad()
+def _fold_gpu_nstep_team(
+    q: deque[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]],
+    gamma: float,
+    pos_share_alpha: float = 0.40,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    obs0, act0, rew0, _, _ = q[0]
+    ag_ret = torch.zeros_like(rew0)
+    team_ret = torch.zeros((rew0.shape[0],), dtype=rew0.dtype, device=rew0.device)
+    disc = 1.0
+    last_next = q[0][3]
+    ended = False
+    for _, _, rew_k, next_k, done_k in q:
+        if pos_share_alpha > 0.0 and rew_k.shape[-1] > 1:
+            r_pos = torch.clamp(rew_k, min=0.0)
+            r_neg = torch.clamp(rew_k, max=0.0)
+            r_shaped = r_neg + (1.0 - pos_share_alpha) * r_pos + pos_share_alpha * r_pos.mean(dim=-1, keepdim=True)
+        else:
+            r_shaped = rew_k
+        ag_ret.add_(r_shaped, alpha=disc)
+        team_ret.add_(rew_k.sum(dim=-1), alpha=disc)
+        disc *= gamma
+        last_next = next_k
+        if done_k:
+            ended = True
+            break
+    boot = torch.zeros_like(team_ret) if ended else torch.full_like(team_ret, disc)
+    return obs0, act0, ag_ret, team_ret, last_next, boot
 
 
 def _dqn_update_step(
@@ -520,6 +726,211 @@ def _run_dqn_gpu(
     return episodes_done, train_steps, final_eval, ep_curve, eval_curve, best_state_dict, obs_rms_state
 
 
+def _run_qmix_gpu(
+    scenario: WaterworldScenario,
+    q_net: DuelingQNet,
+    target_net: DuelingQNet,
+    dev: torch.device,
+    action_table_t: torch.Tensor,
+    total_episodes: int,
+    num_envs: int,
+    eval_interval_episodes: int,
+    eval_episodes: int,
+    seed: int,
+    gamma: float,
+    n_step: int,
+    tau: float,
+    batch_size: int,
+    warmup_transitions: int,
+    verbose: bool,
+    curriculum_frac: float = 0.20,
+) -> tuple[
+    int,
+    int,
+    dict[str, float],
+    list[dict[str, float]],
+    list[dict[str, float]],
+    dict[str, torch.Tensor],
+    dict[str, Any],
+]:
+    """Cooperative Hybrid Local+QMIX + Correlated Exploration + n_coop Curriculum."""
+    n_actions = int(action_table_t.shape[0])
+    n_agents = scenario.n_pursuers
+    in_dim = scenario.obs_dim + 2
+    state_dim = 2 * scenario.obs_dim
+    phase_t = torch.from_numpy(build_agent_phase_vec(n_agents)).to(dev)
+    obs_rms = RunningMeanStdGPU((scenario.obs_dim,), dev)
+
+    mixer = QMixerNet(n_agents=n_agents, state_dim=state_dim, embed_dim=16).to(dev)
+    target_mixer = QMixerNet(n_agents=n_agents, state_dim=state_dim, embed_dim=16).to(dev)
+    target_mixer.load_state_dict(mixer.state_dict())
+    target_mixer.eval()
+
+    optimizer = torch.optim.Adam(
+        list(q_net.parameters()) + list(mixer.parameters()), lr=3e-4
+    )
+    online_params = [p.data for p in q_net.parameters()] + [p.data for p in mixer.parameters()]
+    target_params = [p.data for p in target_net.parameters()] + [
+        p.data for p in target_mixer.parameters()
+    ]
+
+    buffer = TeamReplayBufferGPU(capacity=75_000, n_agents=n_agents, in_dim=in_dim, device=dev)
+    train_sim = VectorizedWaterworldGPU(num_envs, scenario, dev, seed=seed * 1000 + 10)
+    eval_sim = VectorizedWaterworldGPU(eval_episodes, scenario, dev, seed=900_000)
+
+    use_curriculum = scenario.n_coop > 1 and curriculum_frac > 0.0
+    curriculum_end = int(total_episodes * curriculum_frac) if use_curriculum else 0
+    if use_curriculum:
+        train_sim.set_n_coop(1)
+    curriculum_switched = not use_curriculum
+
+    cal_obs = train_sim.reset()
+    obs_rms.update(cal_obs)
+    cal_steps = min(60, max(5, scenario.max_cycles // 2))
+    act_gen = torch.Generator(device=dev)
+    act_gen.manual_seed(seed + 12345)
+    for _ in range(cal_steps):
+        rand_idx = torch.randint(0, n_actions, (num_envs, n_agents), generator=act_gen, device=dev)
+        cal_obs, _, _, _ = train_sim.step(action_table_t[rand_idx])
+        obs_rms.update(cal_obs)
+    obs_rms_state = obs_rms.to_numpy_state()
+
+    best_eval_team_ret = -float("inf")
+    best_state_dict = {k: v.detach().cpu().clone() for k, v in q_net.state_dict().items()}
+    ep_curve: list[dict[str, float]] = []
+    eval_curve: list[dict[str, float]] = []
+
+    ev0 = _eval_dqn_gpu(eval_sim, q_net, obs_rms, action_table_t, phase_t)
+    ev0["episode"] = 0.0
+    eval_curve.append(ev0)
+
+    episodes_done = 0
+    next_eval_at = eval_interval_episodes
+    train_steps = 0
+    step_counter = 0
+    warmup_team = max(1_000, warmup_transitions // max(n_agents, 1))
+    nstep_q: deque[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]] = deque(
+        maxlen=n_step
+    )
+    obs = train_sim.reset()
+
+    while episodes_done < total_episodes:
+        if not curriculum_switched and episodes_done >= curriculum_end:
+            curriculum_switched = True
+            train_sim.set_n_coop(scenario.n_coop)
+            nstep_q.clear()
+            obs = train_sim.reset()
+            best_eval_team_ret = -float("inf")
+            if verbose:
+                print(
+                    f"  [QMIX:{scenario.key:11s}] curriculum switch -> n_coop={scenario.n_coop} at ep={episodes_done}",
+                    flush=True,
+                )
+
+        if not curriculum_switched:
+            stage_prog = min(episodes_done / max(curriculum_end, 1), 1.0)
+            eps = 1.0 - 0.80 * stage_prog
+        else:
+            rem_eps = max(total_episodes - curriculum_end, 1)
+            stage_prog = min((episodes_done - curriculum_end) / max(int(rem_eps * 0.55), 1), 1.0)
+            eps = (0.25 - 0.20 * stage_prog) if use_curriculum else (1.0 - 0.95 * stage_prog)
+
+        with torch.inference_mode():
+            obs_feat = append_phase_features_torch(obs_rms.normalize(obs), phase_t)
+            greedy_idx = torch.argmax(q_net(obs_feat.reshape(-1, in_dim)), dim=-1).reshape(
+                num_envs, n_agents
+            )
+            rand_mask = torch.rand((num_envs, n_agents), generator=act_gen, device=dev) < eps
+            indep_rand = torch.randint(
+                0, n_actions, (num_envs, n_agents), generator=act_gen, device=dev
+            )
+            # Correlated team exploration on 50% of envs so teammates drift cohesively onto food.
+            shared_dir = torch.randint(
+                0, n_actions, (num_envs, 1), generator=act_gen, device=dev
+            ).expand(num_envs, n_agents)
+            corr_env = (torch.rand((num_envs, 1), generator=act_gen, device=dev) < 0.5).expand(
+                num_envs, n_agents
+            )
+            rand_idx = torch.where(corr_env, shared_dir, indep_rand)
+            chosen_idx = torch.where(rand_mask, rand_idx, greedy_idx)
+            acts = action_table_t[chosen_idx]
+
+        next_obs, rewards, _, infos = train_sim.step(acts)
+        done_flag = infos is not None
+        next_feat = append_phase_features_torch(obs_rms.normalize(next_obs), phase_t)
+        nstep_q.append((obs_feat, chosen_idx, rewards, next_feat, done_flag))
+
+        if len(nstep_q) == n_step:
+            b_o, b_a, b_ra, b_rt, b_no, b_bg = _fold_gpu_nstep_team(nstep_q, gamma)
+            buffer.add_batch(b_o, b_a, b_ra, b_rt, b_no, b_bg)
+            nstep_q.popleft()
+        if done_flag:
+            while nstep_q:
+                b_o, b_a, b_ra, b_rt, b_no, b_bg = _fold_gpu_nstep_team(nstep_q, gamma)
+                buffer.add_batch(b_o, b_a, b_ra, b_rt, b_no, b_bg)
+                nstep_q.popleft()
+            for info in infos:  # type: ignore[union-attr]
+                if episodes_done < total_episodes:
+                    episodes_done += 1
+                    ep_curve.append(
+                        {
+                            "episode": float(episodes_done),
+                            "team_return": float(info["team_return"]),
+                            "mean_agent_return": float(info["mean_agent_return"]),
+                            "food_events": float(info["food_events"]),
+                            "poison_hits": float(info["poison_hits"]),
+                        }
+                    )
+
+        obs = next_obs
+        step_counter += 1
+
+        if buffer.size >= warmup_team and step_counter % 8 == 0:
+            n_grad = max(2, round((num_envs * 8) / 48.0))
+            bs_now = min(256, max(64, batch_size // max(n_agents, 1) * 2))
+            for _ in range(n_grad):
+                b_s, b_a, b_ra, b_rt, b_ns, b_bg = buffer.sample(bs_now)
+                _qmix_update_step(
+                    q_net,
+                    target_net,
+                    mixer,
+                    target_mixer,
+                    optimizer,
+                    online_params,
+                    target_params,
+                    b_s,
+                    b_a,
+                    b_ra,
+                    b_rt,
+                    b_ns,
+                    b_bg,
+                    tau,
+                )
+                train_steps += 1
+
+        if episodes_done >= next_eval_at or episodes_done >= total_episodes:
+            ev = _eval_dqn_gpu(eval_sim, q_net, obs_rms, action_table_t, phase_t)
+            ev["episode"] = float(episodes_done)
+            eval_curve.append(ev)
+            if ev["mean_team_return"] > best_eval_team_ret:
+                best_eval_team_ret = ev["mean_team_return"]
+                best_state_dict = {k: v.detach().cpu().clone() for k, v in q_net.state_dict().items()}
+            if verbose:
+                print(
+                    f"  [QMIX:{scenario.key:11s}] ep={episodes_done:3d}/{total_episodes} | "
+                    f"eps={eps:.2f} | eval_team={ev['mean_team_return']:+6.2f} "
+                    f"(agent={ev['mean_agent_return']:+5.2f}, food={ev['mean_food_events']:4.1f}, "
+                    f"poison={ev['mean_poison_hits']:4.1f})",
+                    flush=True,
+                )
+            next_eval_at += eval_interval_episodes
+
+    q_net.load_state_dict(best_state_dict)
+    q_net.to(dev)
+    final_eval = _eval_dqn_gpu(eval_sim, q_net, obs_rms, action_table_t, phase_t)
+    return episodes_done, train_steps, final_eval, ep_curve, eval_curve, best_state_dict, obs_rms_state
+
+
 def train_double_dqn(
     scenario: WaterworldScenario,
     total_episodes: int = 600,
@@ -532,6 +943,7 @@ def train_double_dqn(
     warmup_transitions: int = 5_000,
     use_gpu_sim: bool = True,
     arch: str = "transformer",
+    coop_mode: bool = False,
 ) -> dict[str, Any]:
     """Train 5-step Dueling Double DQN with discretized thrust actions on WaterWorld."""
     t_start = time.perf_counter()
@@ -574,37 +986,65 @@ def train_double_dqn(
 
     if use_gpu_sim and dev.type == "cuda":
         action_table_t = torch.from_numpy(action_table).to(dev)
-        (
-            episodes_done,
-            train_steps,
-            final_eval,
-            ep_curve,
-            eval_curve,
-            best_state_dict,
-            obs_rms_state,
-        ) = _run_dqn_gpu(
-            scenario=scenario,
-            q_net=q_net,
-            target_net=target_net,
-            optimizer=optimizer,
-            q_params=q_params,
-            t_params=t_params,
-            dev=dev,
-            action_table_t=action_table_t,
-            total_episodes=total_episodes,
-            num_envs=num_envs,
-            eval_interval_episodes=eval_interval_episodes,
-            eval_episodes=eval_episodes,
-            seed=seed,
-            gamma=gamma,
-            n_step=n_step,
-            tau=tau,
-            batch_size=batch_size,
-            warmup_transitions=warmup_transitions,
-            verbose=verbose,
-        )
+        if coop_mode:
+            (
+                episodes_done,
+                train_steps,
+                final_eval,
+                ep_curve,
+                eval_curve,
+                best_state_dict,
+                obs_rms_state,
+            ) = _run_qmix_gpu(
+                scenario=scenario,
+                q_net=q_net,
+                target_net=target_net,
+                dev=dev,
+                action_table_t=action_table_t,
+                total_episodes=total_episodes,
+                num_envs=num_envs,
+                eval_interval_episodes=eval_interval_episodes,
+                eval_episodes=eval_episodes,
+                seed=seed,
+                gamma=gamma,
+                n_step=n_step,
+                tau=tau,
+                batch_size=batch_size,
+                warmup_transitions=warmup_transitions,
+                verbose=verbose,
+            )
+        else:
+            (
+                episodes_done,
+                train_steps,
+                final_eval,
+                ep_curve,
+                eval_curve,
+                best_state_dict,
+                obs_rms_state,
+            ) = _run_dqn_gpu(
+                scenario=scenario,
+                q_net=q_net,
+                target_net=target_net,
+                optimizer=optimizer,
+                q_params=q_params,
+                t_params=t_params,
+                dev=dev,
+                action_table_t=action_table_t,
+                total_episodes=total_episodes,
+                num_envs=num_envs,
+                eval_interval_episodes=eval_interval_episodes,
+                eval_episodes=eval_episodes,
+                seed=seed,
+                gamma=gamma,
+                n_step=n_step,
+                tau=tau,
+                batch_size=batch_size,
+                warmup_transitions=warmup_transitions,
+                verbose=verbose,
+            )
         return {
-            "algo": "DQN",
+            "algo": "QMIX" if coop_mode else "DQN",
             "scenario": scenario.key,
             "elapsed_sec": float(time.perf_counter() - t_start),
             "total_episodes": int(episodes_done),

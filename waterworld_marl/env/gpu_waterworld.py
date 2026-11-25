@@ -52,6 +52,7 @@ class VectorizedWaterworldGPU:
         self.n_evaders = int(scenario.n_evaders)
         self.n_poisons = int(scenario.n_poisons)
         self.n_coop = int(scenario.n_coop)
+        self._g_n_coop = torch.tensor(self.n_coop, dtype=torch.int32, device=self.device)
         self.n_sensors = int(scenario.n_sensors)
         self.speed_features = bool(scenario.speed_features)
         self.max_cycles = int(scenario.max_cycles)
@@ -526,8 +527,8 @@ class VectorizedWaterworldGPU:
         n_ent = entered.sum(dim=1, dtype=torch.int32)
         n_ext = exited.sum(dim=1, dtype=torch.int32)
         cnt_after_begin = self.ev_counter + n_ent
-        begin_cap_e = (n_ent > 0) & (cnt_after_begin >= self.n_coop)
-        sep_cap_e = (n_ext > 0) & (cnt_after_begin >= self.n_coop)
+        begin_cap_e = (n_ent > 0) & (cnt_after_begin >= self._g_n_coop)
+        sep_cap_e = (n_ext > 0) & (cnt_after_begin >= self._g_n_coop)
 
         food_hits_agent = (
             (entered & begin_cap_e.unsqueeze(1)).to(self.dtype).sum(dim=2)
@@ -557,6 +558,11 @@ class VectorizedWaterworldGPU:
         self.ep_food_events.add_(food_hits_agent.sum(dim=-1))
         self.ep_poison_hits.add_(poison_counts.sum(dim=-1))
         self._g_next_obs.copy_(self.observe())
+
+    def set_n_coop(self, n_coop: int) -> None:
+        """Dynamically update cooperative capture threshold without invalidating CUDA Graph."""
+        self.n_coop = int(n_coop)
+        self._g_n_coop.fill_(self.n_coop)
 
     @torch.no_grad()
     def step(

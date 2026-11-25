@@ -123,8 +123,36 @@ def _build_grid_coords(obs_range: int) -> torch.Tensor:
     return torch.stack([gy.reshape(-1), gx.reshape(-1)], dim=-1)
 
 
+class _AgentCommBlock(nn.Module):
+    """C4-invariant Cross-Agent Self-Attention over teammates' recurrent GRU states."""
+
+    def __init__(self, in_dim: int, comm_dim: int, n_heads: int) -> None:
+        super().__init__()
+        if comm_dim % n_heads != 0:
+            raise ValueError(f"comm_dim={comm_dim} must be divisible by comm_heads={n_heads}")
+        self.comm_dim = comm_dim
+        self.n_heads = n_heads
+        self.head_dim = comm_dim // n_heads
+        self.ln = nn.LayerNorm(in_dim)
+        self.qkv = nn.Linear(in_dim, 3 * comm_dim)
+        self.proj = nn.Linear(comm_dim, comm_dim)
+        self.out_norm = nn.LayerNorm(comm_dim)
+
+    def forward(self, h_team: torch.Tensor) -> torch.Tensor:
+        """Exchange messages within each team group: (G, A, in_dim) -> (G, A, comm_dim)."""
+        g_sz, a_sz, _ = h_team.shape
+        hn = self.ln(h_team)
+        qkv = self.qkv(hn).view(g_sz, a_sz, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        attn = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        )
+        out = self.proj(attn.transpose(1, 2).reshape(g_sz, a_sz, self.comm_dim))
+        return self.out_norm(out)
+
+
 class PursuitPolicyNet(nn.Module):
-    """Deep CNN or Patch-Transformer (optionally C4-equivariant + GRU) policy for Pursuit.
+    """Deep CNN or Patch-Transformer (optionally C4-equivariant + GRU + Comm) policy for Pursuit.
 
     Each agent receives its local `(3, obs_range, obs_range)` grid observation,
     optionally concatenated with its previous action one-hot vector and a
@@ -143,13 +171,24 @@ class PursuitPolicyNet(nn.Module):
         self.cfg = model_cfg or ModelConfig()
         self.obs_range = obs_range
         self.n_actions = n_actions
-        self.is_transformer = self.cfg.arch in ("transformer", "eq_transformer")
-        self.is_equivariant = self.cfg.arch in ("eq_cnn_gru", "eq_transformer")
+        self.has_conv_stem = self.cfg.arch == "eq_comm_transformer"
+        self.has_comm = self.cfg.arch == "eq_comm_transformer"
+        self.is_transformer = self.cfg.arch in (
+            "transformer",
+            "eq_transformer",
+            "eq_comm_transformer",
+        )
+        self.is_equivariant = self.cfg.arch in (
+            "eq_cnn_gru",
+            "eq_transformer",
+            "eq_comm_transformer",
+        )
         self.is_recurrent = self.cfg.arch in (
             "cnn_gru",
             "eq_cnn_gru",
             "transformer",
             "eq_transformer",
+            "eq_comm_transformer",
         )
         act_name = self.cfg.activation
 
@@ -159,7 +198,17 @@ class PursuitPolicyNet(nn.Module):
         if self.is_transformer:
             d_model = self.cfg.transformer_dim
             self.conv = None
-            self.patch_proj: nn.Linear | None = nn.Linear(5, d_model)
+            if self.has_conv_stem:
+                c_stem = self.cfg.conv_stem_channels
+                self.stem_conv: nn.Sequential | None = nn.Sequential(
+                    nn.Conv2d(3, c_stem, kernel_size=3, padding=1),
+                    _make_activation(act_name),
+                )
+                patch_in_dim = c_stem + 2
+            else:
+                self.stem_conv = None
+                patch_in_dim = 5
+            self.patch_proj: nn.Linear | None = nn.Linear(patch_in_dim, d_model)
             self.tx_blocks: nn.ModuleList | None = nn.ModuleList(
                 [
                     _GridTransformerBlock(
@@ -174,6 +223,7 @@ class PursuitPolicyNet(nn.Module):
             spatial_out_dim = 2 * d_model
         else:
             c1, c2, c3 = self.cfg.conv_channels
+            self.stem_conv = None
             self.patch_proj = None
             self.tx_blocks = None
             self.tx_norm = None
@@ -203,15 +253,26 @@ class PursuitPolicyNet(nn.Module):
                 _make_activation(act_name),
             )
             self.gru = nn.GRUCell(self.cfg.hidden_dim, self.cfg.gru_dim)
-            dir_in_dim = spatial_out_dim + self.cfg.gru_dim + aux_dim
+            if self.has_comm:
+                self.comm: _AgentCommBlock | None = _AgentCommBlock(
+                    in_dim=self.cfg.gru_dim,
+                    comm_dim=self.cfg.comm_dim,
+                    n_heads=self.cfg.comm_heads,
+                )
+                comm_extra = self.cfg.comm_dim
+            else:
+                self.comm = None
+                comm_extra = 0
+            dir_in_dim = spatial_out_dim + self.cfg.gru_dim + comm_extra + aux_dim
             self.dir_fc = nn.Sequential(
                 nn.Linear(dir_in_dim, self.cfg.hidden_dim),
                 _make_activation(act_name),
             )
             self.dir_head: nn.Linear | None = nn.Linear(self.cfg.hidden_dim, 1)
-            self.stay_head: nn.Linear | None = nn.Linear(self.cfg.gru_dim, 1)
+            self.stay_head: nn.Linear | None = nn.Linear(self.cfg.gru_dim + comm_extra, 1)
             self.head: nn.Linear | None = None
         else:
+            self.comm = None
             self.fc_in = nn.Sequential(
                 nn.Linear(spatial_out_dim + aux_dim, self.cfg.hidden_dim),
                 _make_activation(act_name),
@@ -293,6 +354,8 @@ class PursuitPolicyNet(nn.Module):
     def _encode_spatial(self, obs_chw: torch.Tensor) -> torch.Tensor:
         if self.is_transformer:
             assert self.patch_proj is not None and self.tx_blocks is not None and self.tx_norm is not None
+            if self.stem_conv is not None:
+                obs_chw = self.stem_conv(obs_chw)
             bsz, c_ch, h_sz, w_sz = obs_chw.shape
             n_tok = h_sz * w_sz
             cells = obs_chw.permute(0, 2, 3, 1).reshape(bsz, n_tok, c_ch)
@@ -311,6 +374,7 @@ class PursuitPolicyNet(nn.Module):
         prev_actions_onehot: torch.Tensor | None = None,
         agent_phase: torch.Tensor | None = None,
         hidden: torch.Tensor | None = None,
+        team_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         bsz = obs_chw.shape[0]
         if self.cfg.use_prev_action and prev_actions_onehot is None:
@@ -342,6 +406,13 @@ class PursuitPolicyNet(nn.Module):
             next_hidden = self.gru(h, hidden)
 
             dir_parts = [feat_rot, next_hidden.unsqueeze(1).expand(-1, 4, -1)]
+            if self.comm is not None:
+                t_sz = team_size if (team_size is not None and bsz % team_size == 0) else bsz
+                comm_ctx = self.comm(next_hidden.view(bsz // t_sz, t_sz, -1)).reshape(bsz, -1)
+                dir_parts.append(comm_ctx.unsqueeze(1).expand(-1, 4, -1))
+                stay_in = torch.cat([next_hidden, comm_ctx], dim=-1)
+            else:
+                stay_in = next_hidden
             if self.cfg.use_prev_action:
                 assert prev_actions_onehot is not None
                 dir_parts.append(rotate_prev_action_c4(prev_actions_onehot))
@@ -351,7 +422,7 @@ class PursuitPolicyNet(nn.Module):
 
             dir_in = torch.cat(dir_parts, dim=-1).reshape(bsz * 4, -1)
             dir_logits = self.dir_head(self.dir_fc(dir_in)).view(bsz, 4)
-            stay_logit = self.stay_head(next_hidden)
+            stay_logit = self.stay_head(stay_in)
             logits = torch.cat([dir_logits, stay_logit], dim=-1)
             return logits, next_hidden
 

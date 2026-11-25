@@ -30,13 +30,27 @@
 - **Эволюция ([`algos/ga.py`](algos/ga.py)) — `WaterworldGAPolicy`:**
   - **SO(2)-эквивариантный** линейный контроллер (`17` параметров при `speed_features=True`, `11` при `False`) с антитетическими CRN-парами, центрированным ранжированием и momentum-обновлением (`~21–24s` на сценарий).
 
+- **Кооперативные улучшения (`--coop`):**
+  - **Hybrid Local + Monotonic QMIX (`QMixerNet`, [`algos/dqn.py`](algos/dqn.py)):** хранит совместные командные переходы (`TeamReplayBufferGPU`), объединяет локальную ответственность за яд/тягу с монотонным миксером ($\partial Q_{\text{tot}} / \partial Q_i \ge 0$), скоррелированным исследованием и плавным curriculum `n_coop: 1 → 2` (через `VectorizedWaterworldGPU.set_n_coop()` прямо внутри CUDA Graph). Исполнение на тесте остаётся 100% децентрализованным (`10.4K` весов).
+  - **Cooperative CTDE MAPPO (`PPO-Coop`, [`algos/ppo.py`](algos/ppo.py)):** заменяет усредняющий критик на **Cross-Agent Attention Critic** ([`_CrossAgentCriticBlock`](algos/ppo.py)), добавляет рекуррентную память `GRUCell(128→64)` с BPTT-обновлениями по чанкам (`chunk_len=25`), **асимметричное кооперативное кредитование** (яд и тяга остаются 100% локальными, а положительные захваты еды разделяются с командой с весом `α=0.35`) и curriculum `n_coop: 1 → 2`.
+
 ![WaterWorld сравнение архитектур](../docs/waterworld_mlp_vs_transformer.png)
 
 ## Сводка результатов (`600` GPU-эпизодов → `20` сидов `pymunk`)
 
 Указаны **`mean_team_return` (`mean_agent_return`)**, средние события `food / poison` и время обучения (`RTX 4080`):
 
-### 1. Ray-Transformer (`runs/waterworld_tx/`, `--arch transformer`, `717.1s` суммарно)
+### 1. Кооперативный режим `--arch transformer --coop` (`runs/waterworld_coop/`, `921.3s` суммарно)
+
+| Сценарий | Zero | Random | GA (`SO(2)`) | Hybrid QMIX (`Ray-Tx`) | PPO-Coop (`Attn-GRU Ray-Tx`) |
+| --- | ---: | ---: | --- | --- | --- |
+| `base` (`5 ag`) | `-2.25` (`-0.45`) | `-563.18` | `+28.12 ± 49.44` (`+5.62`)<br>`f=14.2 p=6.8 \| 24.0s` | `+8.24 ± 14.37` (`+1.65`)<br>`f=1.5 p=2.5 \| 79.4s` | **`+76.20 ± 42.30`** (`+15.24`)<br>`f=15.5 p=7.9 \| 87.9s` |
+| `single` (`1 ag`) | `+23.78` | `-143.79` | **`+231.12 ± 53.32`**<br>`f=27.4 p=6.6 \| 21.0s` | **`+195.07 ± 70.91`**<br>`f=21.0 p=3.3 \| 75.1s` | **`+190.05 ± 51.09`**<br>`f=21.7 p=5.3 \| 71.5s` |
+| `no_speed` (`5 ag`) | `-2.25` (`-0.45`) | `-563.18` | `+70.18 ± 39.86` (`+14.04`)<br>`f=14.5 p=7.9 \| 23.4s` | **`+8.58 ± 21.66`** (`+1.72`)<br>`f=11.2 p=11.2 \| 80.2s` | **`+78.00 ± 30.74`** (`+15.60`)<br>`f=16.4 p=8.7 \| 86.5s` |
+| `few_sensors` (`5 ag`) | `-2.25` (`-0.45`) | `-563.18` | **`+57.48 ± 31.26`** (`+11.50`)<br>`f=10.7 p=8.2 \| 22.0s` | **`+11.48 ± 27.05`** (`+2.30`)<br>`f=10.0 p=8.5 \| 81.1s` | `+46.58 ± 33.65` (`+9.32`)<br>`f=12.3 p=7.6 \| 78.7s` |
+| `more_poison` (`5 ag`) | `-12.57` (`-2.51`) | `-584.55` | **`+33.65 ± 30.49`** (`+6.73`)<br>`f=8.7 p=15.5 \| 22.9s` | **`-1.04 ± 12.07`** (`-0.21`)<br>`f=0.9 p=2.2 \| 80.0s` | `+18.16 ± 29.85` (`+3.63`)<br>`f=8.0 p=12.7 \| 87.6s` |
+
+### 2. Базовый Ray-Transformer (`runs/waterworld_tx/`, `--arch transformer`, `717.1s` суммарно)
 
 | Сценарий | Zero | Random | GA (`SO(2)`) | DQN (`Ray-Tx`, 10.4K) | PPO (`Ray-Tx`, 18.9K) |
 | --- | ---: | ---: | --- | --- | --- |
@@ -46,7 +60,7 @@
 | `few_sensors` (`5 ag`) | `-2.25` (`-0.45`) | `-563.18` | `+57.48 ± 31.26` (`+11.50`)<br>`f=10.7 p=8.2 \| 22.2s` | `+4.02 ± 9.00` (`+0.80`)<br>`f=1.0 p=2.9 \| 59.2s` | **`+63.59 ± 46.14`** (`+12.72`)<br>`f=14.9 p=6.5 \| 65.2s` |
 | `more_poison` (`5 ag`) | `-12.57` (`-2.51`) | `-584.55` | **`+33.76 ± 30.50`** (`+6.75`)<br>`f=8.7 p=15.4 \| 22.2s` | `-3.67 ± 11.54` (`-0.73`)<br>`f=0.7 p=1.2 \| 57.9s` | `+21.26 ± 32.10` (`+4.25`)<br>`f=6.6 p=2.3 \| 74.7s` |
 
-### 2. Базовая нейросетевая конфигурация MLP + SO(2) GA (`runs/waterworld/`, `--arch mlp`, `491.9s` суммарно)
+### 3. Базовая нейросетевая конфигурация MLP + SO(2) GA (`runs/waterworld/`, `--arch mlp`, `491.9s` суммарно)
 
 | Сценарий | Zero | Random | GA (`SO(2)`) | Double DQN (`MLP`, 29–50K) | MAPPO (`MLP`, 67–128K) |
 | --- | ---: | ---: | --- | --- | --- |
@@ -63,7 +77,12 @@
 ```powershell
 $env:PYTHONIOENCODING="utf-8"
 
-# Ray-Transformer (по умолчанию):
+# Кооперативный режим (Hybrid QMIX + Cross-Agent Attention/GRU MAPPO + curriculum):
+.\venv\Scripts\python.exe -m waterworld_marl.run_experiments `
+  --episodes 600 --eval-interval 100 --eval-episodes 8 --heldout-episodes 20 `
+  --device cuda --arch transformer --coop --out-dir runs/waterworld_coop
+
+# Базовый Ray-Transformer:
 .\venv\Scripts\python.exe -m waterworld_marl.run_experiments `
   --episodes 600 --eval-interval 100 --eval-episodes 8 --heldout-episodes 20 `
   --device cuda --arch transformer --out-dir runs/waterworld_tx

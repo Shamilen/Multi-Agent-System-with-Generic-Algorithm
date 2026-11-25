@@ -18,13 +18,14 @@
 | `cnn_gru` | 3-слойный `Conv2d(3→8→12→8)` | Нет | `GRUCell(24→20)` | `6,757` |
 | `eq_cnn_gru` | 4-поворотный shared `Conv2d(3→8→12→8)` | Точная | `GRUCell(24→20)` | `8,954` |
 | `transformer` | [`_GridTransformerBlock`](networks.py) (`49` токенов, `d=16, 2h, 1L, d_ff=32`) + 2D-коорд. `(dy, dx)` | Нет | `GRUCell(24→20)` | `6,177` |
-| **`eq_transformer` (default)** | 4-поворотный shared [`_GridTransformerBlock`](networks.py) (`d=16, 2h, 1L, d_ff=32`) | **Точная** | `GRUCell(24→20)` | **`7,414`** |
+| `eq_transformer` (default) | 4-поворотный shared [`_GridTransformerBlock`](networks.py) (`d=16, 2h, 1L, d_ff=32`) | **Точная** | `GRUCell(24→20)` | `7,414` |
+| **`eq_comm_transformer`** | Гибридный `3×3` Conv-стем (`8` кан.) + 4-поворотный [`_GridTransformerBlock`](networks.py) + межагентный Self-Attention [`_AgentCommBlock`](networks.py) (`comm_dim=12, 2h`) | **Точная** | `GRUCell(24→20)` | **`8,994`** |
 
-### Механизм точной C4-эквивариантности (`eq_cnn_gru` и `eq_transformer`)
+### Механизм точной C4-эквивариантности (`eq_cnn_gru`, `eq_transformer` и `eq_comm_transformer`)
 1. Вход `(3, 7, 7)` проецируется в 4 ортогональные ориентации (`rotate_obs_c4`), соответствующие `[LEFT, RIGHT, DOWN, UP]`.
 2. Общий пространственный энкодер извлекает признаки каждой ориентации; инвариантное среднее по 4 направлениям (+ флаг предыдущего `STAY`) подаётся в `GRUCell(24 → 20)`.
-3. Направленная голова `dir_fc → dir_head` оценивает каждое из 4 направлений по ориентированным признакам карты, скрытому состоянию GRU, циклически переставленному прошлому действию (`rotate_prev_action_c4`) и повёрнутой фазе агента (`rotate_agent_phase_c4`), а `stay_head` независимо оценивает действие `STAY`.
-4. Для `eq_transformer` каждая из `49` ячеек окна конкатенируется со статическими относительными координатами `(dy, dx)` ([`_build_grid_coords`](networks.py)), проецируется `Linear(5 → 16)`, проходит 1 слой Pre-LN Self-Attention, после чего конкатенируются токен центра агента и глобальное среднее (`2 * d_model = 32`).
+3. В `eq_comm_transformer` поверх C4-инвариантных состояний `GRU` всей команды из `8` агентов выполняется раунд межагентного Self-Attention ([`_AgentCommBlock`](networks.py)), сохраняющий **точную C4-эквивариантность** (подтверждено тестами) и передающий контекст команды в головы действий.
+4. В [`GPUPopulationEvaluator`](gpu_sim.py) поддерживается тренировочный кооперативный shaping: анти-наложение (`--overlap-penalty`) и поощрение разностороннего окружения цели (`--flank-bonus`); итоговые метрики всегда считаются на чистой среде PettingZoo.
 
 ## Генетический алгоритм и CUDA-симуляция
 
@@ -41,18 +42,21 @@
 | Greedy Heuristic | `—` | `-44.01 ± 0.57` | `0.00 / 30` | `0.0%` | `0.0%` | `—` | Жадное сближение |
 | `eq_cnn_gru` (`Argmax`) | `8,954` | `-18.31 ± 4.56` | `22.45 / 30` | `74.8%` | `0.0%` | `0.641` | `[19952, 20000, 20118, 19804, 126]` |
 | **`eq_cnn_gru` (`Stochastic T=0.15`)** | `8,954` | **`-17.40 ± 2.63`** | **`24.65 / 30`** | **`82.2%`** | `0.0%` | **`0.223`** | `[19905, 19637, 19929, 19943, 586]` |
-| **`eq_transformer` (`Argmax`)** | **`7,414`** | **`-19.42 ± 3.98`** | **`23.90 / 30`** | **`79.7%`** | **`5.0%`** | `2.246` | `[18845, 19799, 20608, 20556, 0]` |
+| `eq_transformer` (`Argmax`) | `7,414` | `-19.42 ± 3.98` | `23.90 / 30` | `79.7%` | **`5.0%`** | `2.246` | `[18845, 19799, 20608, 20556, 0]` |
 | `eq_transformer` (`Stochastic T=0.15`) | `7,414` | `-20.17 ± 2.44` | `23.30 / 30` | `77.7%` | `0.0%` | `2.909` | `[19887, 20083, 20179, 19806, 45]` |
+| **`eq_comm_transformer` (`Argmax`)** | `8,994` | `-19.47 ± 3.12` | `23.40 / 30` | `78.0%` | `0.0%` | **`0.118`** | `[21355, 20717, 19021, 18907, 0]` |
+| **`eq_comm_transformer` (`Stoch T=0.15`)** | `8,994` | `-19.74 ± 2.82` | `23.55 / 30` | `78.5%` | `0.0%` | **`0.142`** | `[20062, 20045, 19987, 19905, 1]` |
 
 ## CLI запуска
 
 ```powershell
-# Обучение (по умолчанию --arch eq_transformer)
-.\venv\Scripts\python.exe -u -m pursuit_ga.train --device cuda --output-dir runs/pursuit_ga_transformer
+# Обучение гибридного C4 Comm-Transformer с кооперативным shaping
+.\venv\Scripts\python.exe -u -m pursuit_ga.train --device cuda --arch eq_comm_transformer --overlap-penalty 1.0 --flank-bonus 0.5 --output-dir runs/pursuit_ga_coop
 
-# Обучение свёрточно-рекуррентной политики
+# Обучение базового C4 Vision-Transformer (--arch eq_transformer) или CNN-GRU (--arch eq_cnn_gru)
+.\venv\Scripts\python.exe -u -m pursuit_ga.train --device cuda --arch eq_transformer --output-dir runs/pursuit_ga_transformer
 .\venv\Scripts\python.exe -u -m pursuit_ga.train --device cuda --arch eq_cnn_gru --output-dir runs/pursuit_ga_eq
 
 # Оценка любого сохранённого чекпоинта на PettingZoo (обратно совместимо со старыми чекпоинтами)
-.\venv\Scripts\python.exe -u -m pursuit_ga.evaluate --checkpoint runs/pursuit_ga_transformer/best_model.pt --episodes 20 --seed-start 470000 --deterministic --save-gif runs/pursuit_ga_transformer/eval_pursuit.gif
+.\venv\Scripts\python.exe -u -m pursuit_ga.evaluate --checkpoint runs/pursuit_ga_coop/best_model.pt --episodes 20 --seed-start 470000 --save-gif runs/pursuit_ga_coop/eval_pursuit.gif
 ```

@@ -100,6 +100,8 @@ def train(cfg: TrainConfig) -> dict[str, Any]:
             env_cfg=cfg.env,
             model_cfg=cfg.model,
             catch_bonus_weight=cfg.ga.catch_bonus_weight,
+            overlap_penalty_weight=cfg.ga.overlap_penalty_weight,
+            flank_bonus_weight=cfg.ga.flank_bonus_weight,
             device=device,
         )
     else:
@@ -284,7 +286,7 @@ def parse_args() -> TrainConfig:
         "--arch",
         type=str,
         default="eq_transformer",
-        choices=["cnn", "cnn_gru", "eq_cnn_gru", "transformer", "eq_transformer"],
+        choices=["cnn", "cnn_gru", "eq_cnn_gru", "transformer", "eq_transformer", "eq_comm_transformer"],
     )
     parser.add_argument("--conv-channels", type=int, nargs=3, default=[8, 12, 8])
     parser.add_argument("--hidden-dim", type=int, default=24)
@@ -299,6 +301,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--sigma-min", type=float, default=0.007)
     parser.add_argument("--mutation-decay", type=float, default=0.978)
     parser.add_argument("--catch-bonus", type=float, default=0.8)
+    parser.add_argument("--overlap-penalty", type=float, default=0.0)
+    parser.add_argument("--flank-bonus", type=float, default=0.0)
     parser.add_argument("--max-cycles", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default="runs/pursuit_ga")
@@ -329,6 +333,8 @@ def parse_args() -> TrainConfig:
             mutation_decay=args.mutation_decay,
             consensus_lr=args.consensus_lr,
             catch_bonus_weight=args.catch_bonus,
+            overlap_penalty_weight=args.overlap_penalty,
+            flank_bonus_weight=args.flank_bonus,
         ),
         seed=args.seed,
         device=args.device,

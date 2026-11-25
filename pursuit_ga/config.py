@@ -52,7 +52,7 @@ class EnvConfig:
 class ModelConfig:
     """Architecture and action selection configuration for the Deep MARL policy."""
 
-    arch: str = "eq_transformer"  # "cnn", "cnn_gru", "eq_cnn_gru", "transformer", or "eq_transformer"
+    arch: str = "eq_transformer"  # "cnn", "cnn_gru", "eq_cnn_gru", "transformer", "eq_transformer", or "eq_comm_transformer"
     conv_channels: tuple[int, int, int] = (8, 12, 8)
     hidden_dim: int = 24
     gru_dim: int = 20
@@ -60,6 +60,9 @@ class ModelConfig:
     transformer_heads: int = 2
     transformer_layers: int = 1
     transformer_ffn_dim: int = 32
+    conv_stem_channels: int = 8
+    comm_dim: int = 12
+    comm_heads: int = 2
     activation: str = "tanh"  # "tanh", "elu", "leaky_relu"
     use_prev_action: bool = True
     use_agent_phase: bool = True
@@ -90,6 +93,8 @@ class GAConfig:
     immigrant_count: int = 3
     layer_scaled_mutation: bool = True
     catch_bonus_weight: float = 0.8  # auxiliary capture shaping; eval uses pure PettingZoo return
+    overlap_penalty_weight: float = 0.0  # optional training-only anti-stacking shaping
+    flank_bonus_weight: float = 0.0  # optional training-only multi-side surround shaping
 
 
 @dataclass

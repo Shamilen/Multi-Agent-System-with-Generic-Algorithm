@@ -330,6 +330,11 @@ def main() -> None:
     parser.add_argument("--scenarios", nargs="+", default=list(SCENARIOS.keys()))
     parser.add_argument("--algos", nargs="+", default=["GA", "DQN", "PPO"])
     parser.add_argument("--arch", type=str, default="transformer", choices=["transformer", "mlp"])
+    parser.add_argument(
+        "--coop",
+        action="store_true",
+        help="Enable cooperative MARL upgrades (QMIX + Cross-Agent Attention Critic + GRU + n_coop curriculum)",
+    )
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
@@ -397,6 +402,7 @@ def main() -> None:
                     device=args.device,
                     verbose=True,
                     arch=args.arch,
+                    coop_mode=args.coop,
                 )
             else:
                 res = train_ppo(
@@ -409,6 +415,7 @@ def main() -> None:
                     device=args.device,
                     verbose=True,
                     arch=args.arch,
+                    coop_mode=args.coop,
                 )
 
             ckpt_payload = {"state_dict": res["state_dict"]}
